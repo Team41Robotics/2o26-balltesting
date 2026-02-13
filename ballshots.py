@@ -68,46 +68,110 @@ while True:
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # We'll compute the image-space centroid (COM) for the ball and decide validity here.
     ball_cam = None
+    ball_pixel = None
+    ball_valid = False
+    diameter_px = None
     if contours:
+        # choose largest contour
         cnt = max(contours, key=cv2.contourArea)
-        (x, y), radius = cv2.minEnclosingCircle(cnt)
-        # average out diameter for less flickering4
-        diameter_px = radius * 2
-        diameter_avg.append(diameter_px)
-        if len(diameter_avg) >= 5:
-            diameter_avg.pop(0)
-        diameter_px = sum(diameter_avg) / len(diameter_avg)
+        area = cv2.contourArea(cnt)
+        if area > 50:  # ignore tiny noise
+            # circularity check: 4*pi*area / perimeter^2 (1.0 for perfect circle)
+            perim = cv2.arcLength(cnt, True)
+            circularity = 0.0
+            if perim > 0:
+                circularity = 4.0 * np.pi * area / (perim * perim)
 
-        if diameter_px > 25:
-            Z_cam = FOCAL_LENGTH_PX * BALL_DIAMETER_IN / diameter_px
-            X_cam = (x - cx) * Z_cam / fx
-            Y_cam = (y - cy) * Z_cam / fy
-            ball_cam = np.array([X_cam, Y_cam, Z_cam]).reshape((3,1))
-            cv2.circle(frame, (int(x), int(y)), int(radius), (0, 255, 0), 2)
-            cv2.circle(frame, (int(x), int(y)), 5, (0, 0, 255), -1)
+            # estimate centroid from moments (center of mass)
+            M = cv2.moments(cnt)
+            if M.get('m00', 0) != 0:
+                cx_cnt = M['m10'] / M['m00']
+                cy_cnt = M['m01'] / M['m00']
+            else:
+                # fallback to bounding rect center
+                x_rect, y_rect, w_rect, h_rect = cv2.boundingRect(cnt)
+                cx_cnt = x_rect + w_rect / 2.0
+                cy_cnt = y_rect + h_rect / 2.0
+
+            # prefer ellipse fit if contour has enough points and is well-formed
+            if len(cnt) >= 5:
+                try:
+                    ellipse = cv2.fitEllipse(cnt)
+                    (ex, ey), (MA, ma), angle = ellipse
+                    # average major/minor as diameter estimate
+                    diameter_px = (MA + ma) / 2.0
+                    # use ellipse center
+                    x = ex
+                    y = ey
+                except cv2.error:
+                    diameter_px = None
+            # fall back to area-based equivalent diameter
+            if diameter_px is None:
+                diameter_px = 2.0 * np.sqrt(area / np.pi)
+                x = cx_cnt
+                y = cy_cnt
+
+            # low-pass the diameter to reduce flicker
+            diameter_avg.append(diameter_px)
+            if len(diameter_avg) >= 5:
+                diameter_avg.pop(0)
+            diameter_px = sum(diameter_avg) / len(diameter_avg)
+
+            # save pixel centroid and a validity flag — Z will be computed by projecting the ray onto the plane
+            ball_pixel = (x, y)
+            if diameter_px > 15 and circularity > 0.1:
+                ball_valid = True
+                # draw fitted ellipse or approximated circle
+                if len(cnt) >= 5 and 'ellipse' in locals():
+                    cv2.ellipse(frame, ellipse, (0,255,0), 2)
+                else:
+                    cv2.circle(frame, (int(round(x)), int(round(y))), int(round(diameter_px/2)), (0,255,0), 2)
+                cv2.circle(frame, (int(round(x)), int(round(y))), 3, (0,0,255), -1)
 
     # -------- AprilTag detection --------
     gray = cv2.cvtColor(frame_blur, cv2.COLOR_BGR2GRAY)
     corners, ids, _ = detector.detectMarkers(gray)
-    if ids is not None and ball_cam is not None:
+    if ids is not None and ball_valid:
         # Estimate pose for all detected tags (tvecs are tag origins in camera coords, in inches)
         rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(corners, TAG_SIZE_INCH, camera_matrix, dist_coeffs)
         aruco.drawDetectedMarkers(frame, corners)
 
-        # Collect tag centers (tvecs) for plane fitting
-        tag_centers = [t.reshape((3,)) for t in tvecs]
-        pts = np.vstack(tag_centers)  # N x 3
+        # Collect all tag corner 3D points (transform tag-local corners into camera frame)
+        corners_3d_cam = []
+        half = TAG_SIZE_INCH / 2.0
+        # tag-local corner coordinates (order: top-left, top-right, bottom-right, bottom-left)
+        tag_corner_coords = np.array([[-half, half, 0.0], [half, half, 0.0], [half, -half, 0.0], [-half, -half, 0.0]])
+        for i in range(len(tvecs)):
+            rvec = rvecs[i].reshape((3,1))
+            tvec = tvecs[i].reshape((3,1))
+            R_i, _ = cv2.Rodrigues(rvec)
+            for corner_tag in tag_corner_coords:
+                corner_cam = (R_i @ corner_tag.reshape((3,1)) + tvec).reshape((3,))
+                corners_3d_cam.append(corner_cam)
 
-        # Fit best plane through tag centers using SVD
+        pts = np.vstack(corners_3d_cam)  # (N_tags*4) x 3
+
+        # Fit best plane through tag corners using SVD
         centroid = pts.mean(axis=0)
         uu, dd, vv = np.linalg.svd(pts - centroid)
         normal = vv[-1, :]
         normal = normal / np.linalg.norm(normal)
 
-        # Project ball center (camera coords) to the plane: P_proj = P - ((P - p0)·n) * n
-        P = ball_cam.reshape((3,))
-        P_proj = P - ((P - centroid) @ normal) * normal
+        # Compute camera ray through detected pixel (use normalized camera coordinates)
+        x_px, y_px = ball_pixel
+        # ray direction in camera coordinates with z=1: r = [ (u-cx)/fx, (v-cy)/fy, 1 ]
+        r = np.array([(x_px - cx) / fx, (y_px - cy) / fy, 1.0])
+        denom = float(r @ normal)
+        if abs(denom) < 1e-6:
+            # Ray nearly parallel to plane; skip this frame
+            continue
+
+        # distance along the ray to intersect the plane: t = (p0·n) / (r·n)
+        t = float((centroid @ normal) / denom)
+        P_proj = (t * r).reshape((3,))
+        ball_cam = P_proj.reshape((3,1))
 
         # Find index of AprilTag ID 0 to use as reference frame. If not present, fall back to first detected tag
         ids_list = ids.flatten().tolist()

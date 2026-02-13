@@ -1,8 +1,12 @@
 import cv2
 import cv2.aruco as aruco
 import numpy as np
+import time
+import csv
+import os
 
 diameter_avg = []
+positions = []  # list to store recorded ball positions (relative to tag 0)
 # ----------------------
 # Camera parameters (approx. for MSI Sword 15 720p)
 # ----------------------
@@ -36,10 +40,14 @@ cap = cv2.VideoCapture(1)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
+# frame counter
+frame_no = 0
+
 while True:
     ret, frame = cap.read()
     if not ret:
         break
+    frame_no += 1
 
     frame_blur = cv2.GaussianBlur(frame, (25, 25), 0)
 
@@ -83,23 +91,59 @@ while True:
     gray = cv2.cvtColor(frame_blur, cv2.COLOR_BGR2GRAY)
     corners, ids, _ = detector.detectMarkers(gray)
     if ids is not None and ball_cam is not None:
+        # Estimate pose for all detected tags (tvecs are tag origins in camera coords, in inches)
         rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(corners, TAG_SIZE_INCH, camera_matrix, dist_coeffs)
-        # Use first tag as reference
-        R_tag2cam, _ = cv2.Rodrigues(rvecs[0])
-        t_tag2cam = tvecs[0].reshape((3,1))
-        # Ball position in tag frame
-        ball_tag = R_tag2cam.T @ (ball_cam - t_tag2cam)
-        X_tag, Y_tag, Z_tag = ball_tag.flatten()
         aruco.drawDetectedMarkers(frame, corners)
-        cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs, rvecs[0], tvecs[0], 2)
-        
-        
-        cv2.putText(frame, f"Ball X_tag: {X_tag:.2f} in", (20,40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,0,0), 2)
-        # x axis tested and looks good - measuring from center of april tag to circle
-        cv2.putText(frame, f"Ball Y_tag: {Y_tag:.2f} in", (20,80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,0,0), 2)
-        # y axis tested and looks fine
-        cv2.putText(frame, f"Ball Z_tag: {Z_tag:.2f} in", (20,120), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,0,0), 2)
-        # z axis looks to be inaccurate 
+
+        # Collect tag centers (tvecs) for plane fitting
+        tag_centers = [t.reshape((3,)) for t in tvecs]
+        pts = np.vstack(tag_centers)  # N x 3
+
+        # Fit best plane through tag centers using SVD
+        centroid = pts.mean(axis=0)
+        uu, dd, vv = np.linalg.svd(pts - centroid)
+        normal = vv[-1, :]
+        normal = normal / np.linalg.norm(normal)
+
+        # Project ball center (camera coords) to the plane: P_proj = P - ((P - p0)·n) * n
+        P = ball_cam.reshape((3,))
+        P_proj = P - ((P - centroid) @ normal) * normal
+
+        # Find index of AprilTag ID 0 to use as reference frame. If not present, fall back to first detected tag
+        ids_list = ids.flatten().tolist()
+        if 0 in ids_list:
+            ref_idx = ids_list.index(0)
+            ref_id = 0
+        else:
+            ref_idx = 0
+            ref_id = int(ids_list[0])
+
+        # Pose of reference tag
+        rvec_ref = rvecs[ref_idx].reshape((3,1))
+        tvec_ref = tvecs[ref_idx].reshape((3,1))
+        R_ref, _ = cv2.Rodrigues(rvec_ref)
+
+        # Transform projected point into reference tag frame: p_tag = R_ref^T * (P_proj - tvec_ref)
+        p_cam = P_proj.reshape((3,1))
+        p_tag = R_ref.T @ (p_cam - tvec_ref)
+        X_tag, Y_tag, Z_tag = p_tag.flatten()
+
+        # Draw axis for reference tag
+        cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs, rvec_ref, tvec_ref, 2)
+
+        # Record position with timestamp and frame number
+        positions.append({
+            "time": time.time(),
+            "frame": frame_no,
+            "ref_tag": int(ref_id),
+            "x_in": float(X_tag),
+            "y_in": float(Y_tag),
+            "z_in": float(Z_tag),
+        })
+
+        cv2.putText(frame, f"Ball X_tag{ref_id}: {X_tag:.2f} in", (20,40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,0,0), 2)
+        cv2.putText(frame, f"Ball Y_tag{ref_id}: {Y_tag:.2f} in", (20,80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,0,0), 2)
+        cv2.putText(frame, f"Ball Z_tag{ref_id}: {Z_tag:.2f} in", (20,120), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,0,0), 2)
     cv2.imshow("Ball Tracking", frame)
     cv2.imshow("Mask", mask)
 
@@ -108,3 +152,15 @@ while True:
 
 cap.release()
 cv2.destroyAllWindows()
+
+# Save recorded positions to CSV
+if positions:
+    out_path = os.path.join(os.path.dirname(__file__), "ball_positions.csv")
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["time", "frame", "ref_tag", "x_in", "y_in", "z_in"]) 
+        for p in positions:
+            writer.writerow([p["time"], p["frame"], p["ref_tag"], p["x_in"], p["y_in"], p["z_in"]])
+    print(f"Saved {len(positions)} positions to {out_path}")
+else:
+    print("No positions recorded.")

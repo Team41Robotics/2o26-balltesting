@@ -1,0 +1,4 @@
+opencv-contrib-python>=4.7.0
+numpy
+# Optional: if you prefer the pupil_apriltags detector
+# pupil-apriltags

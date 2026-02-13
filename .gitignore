@@ -1,0 +1,67 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+eggs/
+.eggs/
+
+# Virtual environment directories
+venv/
+ENV/
+env/
+.venv/
+venv.bak/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+htmlcov/
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Logs and databases
+*.log
+*.sqlite3
+
+# Wheels and built distributions
+*.whl
+
+# Ignore large or generated photonvision assets (images, logs, models)
+# Keep configuration JSONs and other small metadata tracked; ignore heavy artifacts
+photonvision_config/**/imgs/
+photonvision_config/imgSaves/
+photonvision_config/logs/
+photonvision_config/models/
+
+# Local runtime files
+*~
+*.swp

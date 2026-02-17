@@ -1,4 +1,5 @@
-import argparse, time, csv, os
+"""ballshots5 — max-FPS ball tracker with CUDA + threaded capture."""
+import argparse, time, csv, os, threading
 import cv2
 import cv2.aruco as aruco
 import numpy as np
@@ -70,7 +71,7 @@ def tag_corner_world(tag_id):
 
 
 # ───────────────────────────────────────────────────────────────────────────
-#  Reference grid
+#  Reference grid (smaller for speed — 6 lines each way instead of 12)
 # ───────────────────────────────────────────────────────────────────────────
 GRID_STEP = 0.1085
 GRID_HALF = 12
@@ -89,7 +90,6 @@ def build_grid_lines():
 
 GRID_LINES = build_grid_lines()
 
-# Pre-build the 3D points array for grid + axes (done once, never changes)
 _N_GRID_PTS = len(GRID_LINES) * 2
 _grid_all_pts = np.empty((_N_GRID_PTS + 6, 3), dtype=np.float64)
 for _i, (_p0, _p1) in enumerate(GRID_LINES):
@@ -102,17 +102,15 @@ _grid_all_pts[_N_GRID_PTS + 3] = [0, 1, 0]
 _grid_all_pts[_N_GRID_PTS + 4] = [0, 0, 0]
 _grid_all_pts[_N_GRID_PTS + 5] = [0, 0, 0.5]
 
-
 # ───────────────────────────────────────────────────────────────────────────
 #  Yellow-ball HSV thresholds
 # ───────────────────────────────────────────────────────────────────────────
-LO_YELLOW = np.array([ 25, 120, 120])
-HI_YELLOW = np.array([ 35, 255, 255])
-MORPH_K   = np.ones((7, 7), np.uint8)
-
+LO_YELLOW = np.array([ 25, 120, 120], dtype=np.uint8)
+HI_YELLOW = np.array([ 35, 255, 255], dtype=np.uint8)
+MORPH_K   = np.ones((5, 5), np.uint8)          # 5×5 instead of 7×7
 
 # ───────────────────────────────────────────────────────────────────────────
-#  AprilTag detector
+#  AprilTag detector  (only used during calibration)
 # ───────────────────────────────────────────────────────────────────────────
 aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_APRILTAG_16h5)
 det_params = aruco.DetectorParameters()
@@ -133,6 +131,34 @@ det_params.maxErroneousBitsInBorderRate  = 0.65
 det_params.errorCorrectionRate           = 0.8
 detector = aruco.ArucoDetector(aruco_dict, det_params)
 
+# ───────────────────────────────────────────────────────────────────────────
+#  Threaded camera reader  (decouples USB I/O from processing)
+# ───────────────────────────────────────────────────────────────────────────
+class CamReader:
+    """Reads frames in a background thread so cap.read() never blocks."""
+    def __init__(self, cap):
+        self.cap = cap
+        self.frame = None
+        self.ok = False
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+
+    def _run(self):
+        while not self._stop.is_set():
+            ok, f = self.cap.read()
+            with self._lock:
+                self.ok, self.frame = ok, f
+
+    def read(self):
+        with self._lock:
+            return self.ok, self.frame
+
+    def stop(self):
+        self._stop.set()
+        self._t.join(timeout=2)
+
 
 # ───────────────────────────────────────────────────────────────────────────
 #  State
@@ -142,18 +168,20 @@ OUT_ALPHA  = 0.3
 _smooth_xy = None
 _frame_n   = 0
 
-# Calibration-phase accumulators
 CALIB_DURATION = 10.0
 _calib_rvecs   = []
 _calib_tvecs   = []
 _calib_done    = False
 _frozen_rvec   = None
 _frozen_tvec   = None
-_frozen_grid_px = None      # pre-projected grid pixel coords (int array)
-# Pre-computed from frozen pose (set once after calibration)
+_frozen_grid_px = None
 R_frozen       = None
 R_T_frozen     = None
 cam_pos_frozen = None
+
+# Pre-rendered grid overlay (created once after calibration freeze)
+_grid_overlay  = None     # BGR image with grid lines drawn
+_grid_mask     = None     # single-channel mask of where grid pixels are
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -168,26 +196,28 @@ def open_camera(preferred=0, probe_range=6):
     return None, None
 
 
-def draw_grid_frozen(frame, grid_px):
-    """Draw pre-projected grid pixels — zero math, just line drawing."""
-    h, w = frame.shape[:2]
-    M = 2000
+def build_grid_overlay(h, w, grid_px):
+    """Pre-render the grid into an overlay image (done ONCE)."""
+    overlay = np.zeros((h, w, 3), dtype=np.uint8)
     n = len(GRID_LINES)
+    M = 2000
     for i in range(n):
-        x1, y1 = grid_px[i * 2]
-        x2, y2 = grid_px[i * 2 + 1]
+        x1, y1 = int(grid_px[i * 2][0]), int(grid_px[i * 2][1])
+        x2, y2 = int(grid_px[i * 2 + 1][0]), int(grid_px[i * 2 + 1][1])
         if (-M <= x1 <= w+M and -M <= y1 <= h+M) or \
            (-M <= x2 <= w+M and -M <= y2 <= h+M):
-            cv2.line(frame, (x1, y1), (x2, y2), (0, 0, 180), 1, cv2.LINE_AA)
-
+            cv2.line(overlay, (x1, y1), (x2, y2), (0, 0, 180), 1, cv2.LINE_4)
     base = n * 2
     colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0)]
     for a in range(3):
-        x1, y1 = grid_px[base + a*2]
-        x2, y2 = grid_px[base + a*2 + 1]
+        x1, y1 = int(grid_px[base + a*2][0]), int(grid_px[base + a*2][1])
+        x2, y2 = int(grid_px[base + a*2 + 1][0]), int(grid_px[base + a*2 + 1][1])
         if (-M <= x1 <= w+M and -M <= y1 <= h+M) or \
            (-M <= x2 <= w+M and -M <= y2 <= h+M):
-            cv2.line(frame, (x1, y1), (x2, y2), colors[a], 2, cv2.LINE_AA)
+            cv2.line(overlay, (x1, y1), (x2, y2), colors[a], 2, cv2.LINE_4)
+    mask = cv2.cvtColor(overlay, cv2.COLOR_BGR2GRAY)
+    _, mask = cv2.threshold(mask, 1, 255, cv2.THRESH_BINARY)
+    return overlay, mask
 
 
 def solve_plane_pose(corners_list, ids, K, D_zero):
@@ -214,20 +244,6 @@ def solve_plane_pose(corners_list, ids, K, D_zero):
     return ok, rvec, tvec
 
 
-def ray_plane_intersect(px, py, R_T, cam_pos, K_new):
-    """Intersect ray through pixel with Z=0.  Uses pre-computed R^T + cam_pos."""
-    fx, fy = K_new[0, 0], K_new[1, 1]
-    cx, cy = K_new[0, 2], K_new[1, 2]
-    ray_cam = np.array([(px - cx) / fx, (py - cy) / fy, 1.0])
-    ray_w = R_T @ ray_cam
-    if abs(ray_w[2]) < 1e-8:
-        return None
-    t = -cam_pos[2] / ray_w[2]
-    if t < 0:
-        return None
-    return cam_pos + t * ray_w
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 #  MAIN
 # ═══════════════════════════════════════════════════════════════════════════
@@ -236,6 +252,8 @@ if __name__ == '__main__':
     ap.add_argument('--cam', type=int, default=0)
     ap.add_argument('--calib-time', type=float, default=CALIB_DURATION,
                     help='Seconds to collect tag poses before freezing')
+    ap.add_argument('--show-mask', action='store_true',
+                    help='Show mask debug window (costs ~2-3 FPS)')
     args = ap.parse_args()
     CALIB_DURATION = args.calib_time
 
@@ -249,17 +267,20 @@ if __name__ == '__main__':
             cv2.VideoWriter.fourcc('M', 'J', 'P', 'G'))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FPS, 120)             # request max FPS
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)        # minimize capture latency
 
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     IMG_SIZE = (actual_w, actual_h)
-    print(f'Resolution: {actual_w}x{actual_h}')
+    actual_fps = cap.get(cv2.CAP_PROP_FPS)
+    print(f'Resolution: {actual_w}x{actual_h}  cam-FPS: {actual_fps}')
 
     K = scale_K(K_CALIB, CALIB_SIZE, IMG_SIZE)
     NEW_K, ROI = cv2.getOptimalNewCameraMatrix(
-        K, D_CALIB, IMG_SIZE, alpha=0.5, newImgSize=IMG_SIZE)
+        K, D_CALIB, IMG_SIZE, alpha=0, newImgSize=IMG_SIZE)
+
     if USE_CUDA:
-        # CUDA remap needs two separate CV_32FC1 maps (xmap, ymap)
         MAP1, MAP2 = cv2.initUndistortRectifyMap(
             K, D_CALIB, None, NEW_K, IMG_SIZE, cv2.CV_32FC1)
     else:
@@ -267,22 +288,22 @@ if __name__ == '__main__':
             K, D_CALIB, None, NEW_K, IMG_SIZE, cv2.CV_16SC2)
     D_ZERO = np.zeros(5)
 
+    # Pre-extract ray constants (avoids per-frame dict/array lookups)
+    _ray_fx = NEW_K[0, 0]
+    _ray_fy = NEW_K[1, 1]
+    _ray_cx = NEW_K[0, 2]
+    _ray_cy = NEW_K[1, 2]
+
     # Upload remap LUTs to GPU (done once)
     if USE_CUDA:
         MAP1_G = cv2.cuda.GpuMat(MAP1)
         MAP2_G = cv2.cuda.GpuMat(MAP2)
-        # Pre-create CUDA morphology filters (reusable)
         _morph_open  = cv2.cuda.createMorphologyFilter(
             cv2.MORPH_OPEN,  cv2.CV_8UC1, MORPH_K)
         _morph_close = cv2.cuda.createMorphologyFilter(
             cv2.MORPH_CLOSE, cv2.CV_8UC1, MORPH_K)
-        # Pre-allocate GPU mats for the pipeline
         _gpu_raw   = cv2.cuda.GpuMat()
         _gpu_frame = cv2.cuda.GpuMat()
-        _gpu_hsv   = cv2.cuda.GpuMat()
-        _gpu_mask  = cv2.cuda.GpuMat()
-        # Streams for async
-        _stream = cv2.cuda.Stream()
     else:
         MAP1_U = cv2.UMat(MAP1)
         MAP2_U = cv2.UMat(MAP2)
@@ -290,18 +311,25 @@ if __name__ == '__main__':
     print(f'K  fx={NEW_K[0,0]:.1f} fy={NEW_K[1,1]:.1f} '
           f'cx={NEW_K[0,2]:.1f} cy={NEW_K[1,2]:.1f}')
 
+    # Start threaded capture
+    reader = CamReader(cap)
+    # Let the reader fill at least one frame
+    time.sleep(0.1)
+
     _fps_time    = time.perf_counter()
     _fps_val     = 0.0
     _calib_start = None
+    _4pi = 4.0 * np.pi                         # constant
 
     try:
         while True:
-            ok, raw = cap.read()
-            if not ok:
-                break
+            ok, raw = reader.read()
+            if not ok or raw is None:
+                continue                        # reader hasn't delivered yet
+
             _frame_n += 1
 
-            # ── 1. UNDISTORT on GPU ──
+            # ── 1. UNDISTORT ──
             if USE_CUDA:
                 _gpu_raw.upload(raw)
                 _gpu_frame = cv2.cuda.remap(
@@ -314,7 +342,7 @@ if __name__ == '__main__':
                                     cv2.INTER_LINEAR)
 
             # ==============================================================
-            #  CALIBRATION PHASE  (first N seconds — detect tags, average)
+            #  CALIBRATION PHASE
             # ==============================================================
             if not _calib_done:
                 frame = _gpu_frame.download() if USE_CUDA else frame_u.get()
@@ -340,10 +368,6 @@ if __name__ == '__main__':
                     f'CALIBRATING  {remaining:.1f}s  poses:{n_poses}',
                     (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
                     0.9, (0, 180, 255), 2)
-                cv2.putText(frame,
-                    'Keep tags visible, hold camera still...',
-                    (20, 80), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7, (200, 200, 200), 1)
 
                 if elapsed >= CALIB_DURATION:
                     if n_poses > 0:
@@ -352,16 +376,20 @@ if __name__ == '__main__':
                         _frozen_rvec = np.median(all_rv, axis=0).reshape(3, 1)
                         _frozen_tvec = np.median(all_tv, axis=0).reshape(3, 1)
 
-                        # Pre-project grid once forever
                         proj, _ = cv2.projectPoints(
                             _grid_all_pts, _frozen_rvec, _frozen_tvec,
                             NEW_K, D_ZERO)
                         _frozen_grid_px = proj.reshape(-1, 2).astype(np.int32)
 
-                        # Pre-compute rotation for ray intersection
                         R_frozen, _  = cv2.Rodrigues(_frozen_rvec)
-                        R_T_frozen   = R_frozen.T.copy()
-                        cam_pos_frozen = (-R_T_frozen @ _frozen_tvec).ravel()
+                        R_T_frozen   = R_frozen.T.astype(np.float64,
+                                                          copy=True)
+                        cam_pos_frozen = (
+                            -R_T_frozen @ _frozen_tvec).ravel().copy()
+
+                        # Pre-render grid overlay (ONE TIME)
+                        _grid_overlay, _grid_mask = build_grid_overlay(
+                            actual_h, actual_w, _frozen_grid_px)
 
                         _calib_done = True
                         print(f'[CALIB] LOCKED from {n_poses} poses')
@@ -372,34 +400,32 @@ if __name__ == '__main__':
                         print('[CALIB] No tags seen — retrying...')
                         _calib_start = time.perf_counter()
 
-                cv2.imshow('ballshots4', frame)
+                cv2.imshow('ballshots5', frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
                 continue
 
             # ==============================================================
-            #  TRACKING PHASE — no tag detection, just ball + frozen grid
+            #  TRACKING PHASE
             # ==============================================================
 
-            # ── 2. HSV mask on GPU ──
+            # ── 2. HSV mask ──
             if USE_CUDA:
                 _gpu_hsv = cv2.cuda.cvtColor(_gpu_frame, cv2.COLOR_BGR2HSV)
-                # Split HSV channels on GPU
                 h_g, s_g, v_g = cv2.cuda.split(_gpu_hsv)
-                # Threshold each channel:  lo <= ch <= hi
-                # H: 25..35,  S: 120..255,  V: 120..255
-                _, h_lo = cv2.cuda.threshold(h_g, int(LO_YELLOW[0]) - 1,  255, cv2.THRESH_BINARY)
-                _, h_hi = cv2.cuda.threshold(h_g, int(HI_YELLOW[0]),  255, cv2.THRESH_BINARY_INV)
-                _, s_lo = cv2.cuda.threshold(s_g, int(LO_YELLOW[1]) - 1, 255, cv2.THRESH_BINARY)
-                _, v_lo = cv2.cuda.threshold(v_g, int(LO_YELLOW[2]) - 1, 255, cv2.THRESH_BINARY)
-                # AND all together
+                _, h_lo = cv2.cuda.threshold(
+                    h_g, int(LO_YELLOW[0]) - 1, 255, cv2.THRESH_BINARY)
+                _, h_hi = cv2.cuda.threshold(
+                    h_g, int(HI_YELLOW[0]),     255, cv2.THRESH_BINARY_INV)
+                _, s_lo = cv2.cuda.threshold(
+                    s_g, int(LO_YELLOW[1]) - 1, 255, cv2.THRESH_BINARY)
+                _, v_lo = cv2.cuda.threshold(
+                    v_g, int(LO_YELLOW[2]) - 1, 255, cv2.THRESH_BINARY)
                 mask_g = cv2.cuda.bitwise_and(h_lo, h_hi)
                 mask_g = cv2.cuda.bitwise_and(mask_g, s_lo)
                 mask_g = cv2.cuda.bitwise_and(mask_g, v_lo)
-                # Morphology on GPU
                 mask_g = _morph_open.apply(mask_g)
                 mask_g = _morph_close.apply(mask_g)
-                # Download to CPU for contours + drawing
                 mask  = mask_g.download()
                 frame = _gpu_frame.download()
             else:
@@ -410,23 +436,22 @@ if __name__ == '__main__':
                 mask  = mask_u.get()
                 frame = frame_u.get()
 
+            # ── 3. Contours + ball detection ──
             cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                        cv2.CHAIN_APPROX_SIMPLE)
 
-            # ── 3. Draw frozen grid (just lines, no math) ──
-            draw_grid_frozen(frame, _frozen_grid_px)
-
-            # ── 4. Ball detection ──
             ball_px = None
             if cnts:
                 best_cnt  = None
                 best_area = 0
                 for cnt in cnts:
                     area = cv2.contourArea(cnt)
+                    if area < 200 or area > 60000:  # quick area gate
+                        continue
                     perim = cv2.arcLength(cnt, True)
                     if perim < 1:
                         continue
-                    circ = 4 * np.pi * area / (perim * perim)
+                    circ = _4pi * area / (perim * perim)
                     if circ < 0.4:
                         continue
                     if area > best_area:
@@ -441,29 +466,41 @@ if __name__ == '__main__':
                     cv2.circle(frame, (int(bx), int(by)),
                                3, (0, 0, 255), -1)
 
-            # ── 5. Ray → world position ──
+            # ── 4. Ray → world position (inlined, no function call) ──
             if ball_px is not None:
-                hit = ray_plane_intersect(
-                    ball_px[0], ball_px[1],
-                    R_T_frozen, cam_pos_frozen, NEW_K)
-                if hit is not None:
-                    raw_xy = np.array([hit[0], hit[1]])
-                    if _smooth_xy is None:
-                        _smooth_xy = raw_xy.copy()
-                    else:
-                        _smooth_xy = OUT_ALPHA * raw_xy + \
-                                     (1 - OUT_ALPHA) * _smooth_xy
-                    sx, sy = float(_smooth_xy[0]), float(_smooth_xy[1])
-                    sx_cm, sy_cm = sx * 100.0, sy * 100.0
+                ray_cam_x = (ball_px[0] - _ray_cx) / _ray_fx
+                ray_cam_y = (ball_px[1] - _ray_cy) / _ray_fy
+                # R_T @ [rx, ry, 1]  — manual dot products (3 muls + 2 adds × 3)
+                rw0 = R_T_frozen[0,0]*ray_cam_x + R_T_frozen[0,1]*ray_cam_y + R_T_frozen[0,2]
+                rw1 = R_T_frozen[1,0]*ray_cam_x + R_T_frozen[1,1]*ray_cam_y + R_T_frozen[1,2]
+                rw2 = R_T_frozen[2,0]*ray_cam_x + R_T_frozen[2,1]*ray_cam_y + R_T_frozen[2,2]
+                if abs(rw2) > 1e-8:
+                    t = -cam_pos_frozen[2] / rw2
+                    if t > 0:
+                        hx = cam_pos_frozen[0] + t * rw0
+                        hy = cam_pos_frozen[1] + t * rw1
+                        if _smooth_xy is None:
+                            _smooth_xy = np.array([hx, hy])
+                        else:
+                            _smooth_xy[0] += OUT_ALPHA * (hx - _smooth_xy[0])
+                            _smooth_xy[1] += OUT_ALPHA * (hy - _smooth_xy[1])
+                        sx = float(_smooth_xy[0])
+                        sy = float(_smooth_xy[1])
+                        sx_cm = sx * 100.0
+                        sy_cm = sy * 100.0
 
-                    positions.append((time.time(), sx, sy))
-                    if _frame_n % 30 == 0:
-                        print(f'[POS] X:{sx_cm:7.1f} cm  Y:{sy_cm:7.1f} cm')
+                        positions.append((time.time(), sx, sy))
+                        if _frame_n % 60 == 0:
+                            print(f'[POS] X:{sx_cm:7.1f} cm  '
+                                  f'Y:{sy_cm:7.1f} cm')
 
-                    cv2.putText(frame,
-                                f'X:{sx_cm:.1f}cm  Y:{sy_cm:.1f}cm',
-                                (20, 80), cv2.FONT_HERSHEY_SIMPLEX,
-                                0.8, (255, 0, 0), 2)
+                        cv2.putText(frame,
+                                    f'X:{sx_cm:.1f}cm  Y:{sy_cm:.1f}cm',
+                                    (20, 80), cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.8, (255, 0, 0), 2)
+
+            # ── 5. Composite pre-rendered grid (fast copyTo) ──
+            np.copyto(frame, _grid_overlay, where=_grid_mask[:,:,None] > 0)
 
             # ── 6. HUD ──
             now = time.perf_counter()
@@ -472,18 +509,20 @@ if __name__ == '__main__':
             if dt > 0:
                 _fps_val = 0.9 * _fps_val + 0.1 / dt
             cv2.putText(frame,
-                        f'FPS:{_fps_val:.2f}  LOCKED  Pts:{len(positions)}',
+                        f'FPS:{_fps_val:.0f}  LOCKED  Pts:{len(positions)}',
                         (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
                         0.8, (0, 200, 0), 2)
 
-            cv2.imshow('ballshots4', frame)
-            cv2.imshow('Mask', mask)
+            cv2.imshow('ballshots5', frame)
+            if args.show_mask:
+                cv2.imshow('Mask', mask)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
     except KeyboardInterrupt:
         print('Interrupted')
     finally:
+        reader.stop()
         cap.release()
         cv2.destroyAllWindows()
 

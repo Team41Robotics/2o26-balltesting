@@ -64,4 +64,8 @@ photonvision_config/models/
 
 # Local runtime files
 *~
+<<<<<<< HEAD
 *.swp
+=======
+*.swp
+>>>>>>> 6eaf921 (asdf)

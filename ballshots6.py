@@ -47,14 +47,6 @@ D_CALIB = np.array([
     -0.03301555724510292, -0.007126953259440723])
 CALIB_SIZE = (1280, 720)
 
-# # ── OpenCV 5-param recalibration (30 imgs, RMS=1.95 — worse undistortion) ──
-# K_CALIB = np.array([
-#     [702.65491821, 0.0,          617.24417671],
-#     [0.0,          710.6830909,  365.36388257],
-#     [0.0,          0.0,          1.0          ]])
-# D_CALIB = np.array([
-#     -0.38496282, 0.13260825, 0.00877787, 0.00041027, -0.01954818])
-
 # ── Tag layout (metres) ──
 TAG_SIZE    = 0.1016
 TAG_SPACING = 1.0

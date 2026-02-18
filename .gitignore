@@ -62,6 +62,8 @@ photonvision_config/imgSaves/
 photonvision_config/logs/
 photonvision_config/models/
 
+_old/
+
 # Local runtime files
 *~
 <<<<<<< HEAD

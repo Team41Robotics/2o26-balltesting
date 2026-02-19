@@ -9,7 +9,7 @@ Usage:
     python ballshots6.py --no-nt                 # standalone (no NT)
     python ballshots6.py --show-mask             # show HSV debug window
 """
-import argparse, time, json, os, threading, enum, collections
+import argparse, time, json, os, threading, enum, collections, sys
 import cv2
 import cv2.aruco as aruco
 import numpy as np
@@ -48,22 +48,33 @@ D_CALIB = np.array([
 CALIB_SIZE = (1280, 720)
 
 # ── Tag layout (metres) ──
-TAG_SIZE    = 0.1016
-TAG_SPACING = 1.0
+# World frame: X right, Y depth (+Y toward the shooter structure), Z up.
+# Tags are on a VERTICAL face (XZ plane, Y ≈ 0).
+# Layout:
+#   Tag 0 (top-left)  ──────  Tag 1 (top-right)
+#   Tag 2 (bot-left)  ──────  Tag 3 (bot-right)
+#
+# Horizontal separation (tag-centre to tag-centre): TAG_SPACING_H = 1.0 m
+# Vertical   separation (tag-centre to tag-centre): TAG_SPACING_V = 1.0 m
+# Bottom-tag height above floor: half of US letter paper (11 in / 2 = 5.5 in = 0.1397 m)
+TAG_SIZE      = 0.1016              # marker side length (metres)
+TAG_SPACING_H = 1.0                 # horizontal centre-to-centre (metres)
+TAG_SPACING_V = 1.0                 # vertical   centre-to-centre (metres)
+TAG_Z_BOTTOM  = (11 * 0.0254) / 2  # = 0.1397 m — bottom-tag Z height
 TAG_CENTRES = {
-    0: np.array([0.0,         0.0,         0.0]),
-    1: np.array([TAG_SPACING, 0.0,         0.0]),
-    2: np.array([TAG_SPACING, TAG_SPACING, 0.0]),
-    3: np.array([0.0,         TAG_SPACING, 0.0]),
+    0: np.array([0.0,          0.0, TAG_Z_BOTTOM + TAG_SPACING_V]),  # top-left
+    1: np.array([TAG_SPACING_H, 0.0, TAG_Z_BOTTOM + TAG_SPACING_V]),  # top-right
+    2: np.array([0.0,          0.0, TAG_Z_BOTTOM]),                   # bot-left
+    3: np.array([TAG_SPACING_H, 0.0, TAG_Z_BOTTOM]),                  # bot-right
 }
 
 # ── Grid (metres) ──
 GRID_MINOR = 0.25          # quarter-metre lines (dotted)
 GRID_MAJOR = 1.0           # full-metre lines (solid)
-GRID_EXTENT = 3.0          # ±3 m from origin
+GRID_EXTENT = 6.0          # ±3 m from origin
 
 # ── Ball detection ──
-LO_YELLOW = np.array([20, 120, 120], dtype=np.uint8)
+LO_YELLOW = np.array([25, 100, 100], dtype=np.uint8)
 HI_YELLOW = np.array([35, 255, 255], dtype=np.uint8)
 MORPH_K   = np.ones((5, 5), np.uint8)
 
@@ -82,6 +93,8 @@ GRAPH_UPDATE_INTERVAL = 0.15  # seconds between plot refreshes
 
 # ── Calibration ──
 CALIB_DURATION = 10.0
+# PLANE_Y        = -1.0  # world Y (metres from tags) for ball-tracking plane intersection
+PLANE_Y        = -1.0  # world Y (metres from tags) for ball-tracking plane intersection
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -109,39 +122,52 @@ def scale_K(K_orig, orig_size, new_size):
 
 
 def tag_corner_world(tag_id):
+    """World coords of the 4 ArUco corners for tag_id.
+
+    Tags are on a VERTICAL face (world XZ plane, Y ≈ 0).
+    World: X right, Z up.
+
+    The markers are placed rotated 180° on the structure, so ArUco's corner 0
+    (which is image-TL for an upright marker) appears at image-BR here.
+    The world assignment therefore starts at the bottom-right physical corner:
+      0: bottom-right → (+s, 0, -s)   ← image BR
+      1: bottom-left  → (-s, 0, -s)   ← image BL
+      2: top-left     → (-s, 0, +s)   ← image TL
+      3: top-right    → (+s, 0, +s)   ← image TR
+    """
     c = TAG_CENTRES[tag_id]
     s = TAG_SIZE / 2.0
     return np.array([
-        c + [-s, -s, 0], c + [s, -s, 0],
-        c + [ s,  s, 0], c + [-s, s, 0],
+        c + [+s, 0, -s],   # corner 0: image bottom-right
+        c + [-s, 0, -s],   # corner 1: image bottom-left
+        c + [-s, 0, +s],   # corner 2: image top-left
+        c + [+s, 0, +s],   # corner 3: image top-right
     ], dtype=np.float64)
 
 
 def build_grid_lines():
-    """Return list of (p0, p1, is_major) for every grid line."""
+    """Return list of (p0, p1, is_major) for the vertical tracking plane.
+    
+    The plane is at Y = PLANE_Y, spanning X from -EXTENT to +EXTENT 
+    and Z from 0 (floor) to +EXTENT.
+    """
     lines = []
     n_steps = int(GRID_EXTENT / GRID_MINOR)
     for i in range(-n_steps, n_steps + 1):
         coord = i * GRID_MINOR
         major = (abs(coord % GRID_MAJOR) < 1e-6 or
                  abs(coord % GRID_MAJOR - GRID_MAJOR) < 1e-6)
-        lines.append((np.array([-GRID_EXTENT, coord, 0.0]),
-                       np.array([ GRID_EXTENT, coord, 0.0]), major))
-        lines.append((np.array([coord, -GRID_EXTENT, 0.0]),
-                       np.array([coord,  GRID_EXTENT, 0.0]), major))
+        
+        # Horizontal lines (parallel to X axis, at constant Z)
+        # Only draw if Z >= 0
+        if coord >= 0:
+            lines.append((np.array([-GRID_EXTENT, PLANE_Y, coord]),
+                           np.array([ GRID_EXTENT, PLANE_Y, coord]), major))
+        
+        # Vertical lines (parallel to Z axis, at constant X)
+        lines.append((np.array([coord, PLANE_Y, 0.0]),
+                       np.array([coord, PLANE_Y, GRID_EXTENT]), major))
     return lines
-
-
-def build_grid_pts(grid_lines):
-    n = len(grid_lines) * 2
-    pts = np.empty((n + 6, 3), dtype=np.float64)
-    for i, (p0, p1, _) in enumerate(grid_lines):
-        pts[i * 2]     = p0
-        pts[i * 2 + 1] = p1
-    pts[n+0] = [0, 0, 0]; pts[n+1] = [1, 0, 0]
-    pts[n+2] = [0, 0, 0]; pts[n+3] = [0, 1, 0]
-    pts[n+4] = [0, 0, 0]; pts[n+5] = [0, 0, 0.5]
-    return pts
 
 
 def _draw_dashed_line(img, pt1, pt2, color, thickness=1,
@@ -167,90 +193,89 @@ def _draw_dashed_line(img, pt1, pt2, color, thickness=1,
         d += dash + gap
 
 
-def build_grid_overlay(h, w, grid_px, grid_lines):
+def build_grid_overlay(h, w, grid_lines, R, tvec, K, D):
+    """Build the world-space grid overlay in distorted pixel space.
+
+    Projects world-space grid lines (subdivided) using K and D so that
+    they follow the lens distortion of the raw frame.
+    XYZ axis arrows are rendered in blue/green/red.
+    """
     overlay = np.zeros((h, w, 3), dtype=np.uint8)
-    n = len(grid_lines)
+    rvec, _ = cv2.Rodrigues(R)
     M = 2000
-    for i in range(n):
-        x1, y1 = int(grid_px[i*2][0]),   int(grid_px[i*2][1])
-        x2, y2 = int(grid_px[i*2+1][0]), int(grid_px[i*2+1][1])
-        if not ((-M <= x1 <= w+M and -M <= y1 <= h+M) or
-                (-M <= x2 <= w+M and -M <= y2 <= h+M)):
+    subdiv = 200  # points per line segment
+
+    # ── Grid lines ──
+    for p0, p1, is_major in grid_lines:
+        # Subdivide line for smooth distortion curves
+        pts_w = np.array([p0 + (p1 - p0) * t for t in np.linspace(0, 1, subdiv)], dtype=np.float64)
+        proj, _ = cv2.projectPoints(pts_w, rvec, tvec, K, D)
+        px = proj.reshape(-1, 2).astype(np.int32)
+
+        # Check if line is at least partially in view
+        in_view = np.any((px[:, 0] >= -M) & (px[:, 0] <= w+M) & 
+                         (px[:, 1] >= -M) & (px[:, 1] <= h+M))
+        if not in_view:
             continue
-        _, _, is_major = grid_lines[i]
+
+        color = (0, 0, 200) if is_major else (0, 0, 120)
         if is_major:
-            cv2.line(overlay, (x1,y1), (x2,y2),
-                     (0, 0, 200), 1, cv2.LINE_4)
+            cv2.polylines(overlay, [px], False, color, 1, cv2.LINE_4)
         else:
-            _draw_dashed_line(overlay, (x1,y1), (x2,y2),
-                              (0, 0, 120), 1)
-    base = n * 2
-    for a, col in enumerate([(0,0,255),(0,255,0),(255,0,0)]):
-        x1, y1 = int(grid_px[base+a*2][0]),   int(grid_px[base+a*2][1])
-        x2, y2 = int(grid_px[base+a*2+1][0]), int(grid_px[base+a*2+1][1])
-        if (-M <= x1 <= w+M and -M <= y1 <= h+M) or \
-           (-M <= x2 <= w+M and -M <= y2 <= h+M):
-            cv2.line(overlay, (x1,y1), (x2,y2), col, 2, cv2.LINE_4)
+            # For dashed lines, we just draw the segments
+            for j in range(0, subdiv - 1, 2):
+                cv2.line(overlay, tuple(px[j]), tuple(px[j+1]), color, 1, cv2.LINE_4)
+
+    # ── Axis arrows (straight segments are fine for small axis markers) ──
+    axis_pts = np.array([
+        [0, 0, 0], [1, 0, 0],   # X
+        [0, 0, 0], [0, 1, 0],   # Y
+        [0, 0, 0], [0, 0, 0.5]  # Z
+    ], dtype=np.float64)
+    proj_axis, _ = cv2.projectPoints(axis_pts, rvec, tvec, K, D)
+    px_axis = proj_axis.reshape(-1, 2).astype(np.int32)
+    
+    for a, col in enumerate([(0, 0, 255), (0, 255, 0), (255, 0, 0)]):
+        cv2.line(overlay, tuple(px_axis[a*2]), tuple(px_axis[a*2+1]), col, 2, cv2.LINE_4)
+
     mask = cv2.cvtColor(overlay, cv2.COLOR_BGR2GRAY)
     _, mask = cv2.threshold(mask, 1, 255, cv2.THRESH_BINARY)
     return overlay, mask
 
 
 def build_calib_grid_overlay(h, w, K, D, spacing=80, n_samples=200):
-    """Build a blue grid that is regular in *undistorted* pixel space.
+    """Grid regular in *undistorted* pixel space, projected through distortion.
 
-    A uniform pixel grid is created, converted to normalised camera
-    coords, then projected back through the distortion model so the
-    lines show how the calibration warps a perfectly regular pattern.
-    Lines are orthogonal at the image centre and curve toward edges.
+    Shows how the calibration model warps a perfectly uniform grid —
+    lines are straight at the centre and curve toward the edges.
     """
     fx, fy = K[0, 0], K[1, 1]
     cx, cy = K[0, 2], K[1, 2]
-    rvec0 = np.zeros((3, 1), dtype=np.float64)
-    tvec0 = np.zeros((3, 1), dtype=np.float64)
-
+    rvec0 = tvec0 = np.zeros((3, 1), dtype=np.float64)
     overlay = np.zeros((h, w, 3), dtype=np.uint8)
+    margin = int(max(w, h) * 2)
+    sweep = np.linspace(-margin, max(w, h) + margin, n_samples, dtype=np.float64)
 
-    # Extend range well beyond visible frame so that distorted
-    # curves still cover every pixel at the edges.
-    margin = int(max(w, h)*2)
+    # horiz=False → vertical lines (u fixed, v sweeps)
+    # horiz=True  → horizontal lines (v fixed, u sweeps)
+    for horiz in (False, True):
+        size   = h if horiz else w
+        coords = np.arange(-margin, size + margin + 1, spacing, dtype=np.float64)
+        for coord in coords:
+            pts = np.empty((n_samples, 3), dtype=np.float64)
+            pts[:, 0] = (sweep - cx) / fx if horiz else (coord - cx) / fx
+            pts[:, 1] = (coord - cy) / fy if horiz else (sweep - cy) / fy
+            pts[:, 2] = 1.0
+            proj, _ = cv2.projectPoints(pts, rvec0, tvec0, K, D)
+            cv2.polylines(overlay, [proj.reshape(-1, 2).astype(np.int32)],
+                          False, (255, 220, 60), 1, cv2.LINE_AA)
 
-    # -- vertical lines (constant u, sweep v) --
-    u_vals = np.arange(-margin, w + margin + 1, spacing,
-                       dtype=np.float64)
-    v_sweep = np.linspace(-margin, h + margin, n_samples,
-                          dtype=np.float64)
-    for u in u_vals:
-        pts_3d = np.empty((n_samples, 3), dtype=np.float64)
-        pts_3d[:, 0] = (u - cx) / fx
-        pts_3d[:, 1] = (v_sweep - cy) / fy
-        pts_3d[:, 2] = 1.0
-        proj, _ = cv2.projectPoints(pts_3d, rvec0, tvec0, K, D)
-        px = proj.reshape(-1, 2).astype(np.int32)
-        cv2.polylines(overlay, [px], False, (255, 220, 60), 1,
-                      cv2.LINE_AA)
-
-    # -- horizontal lines (constant v, sweep u) --
-    v_vals = np.arange(-margin, h + margin + 1, spacing,
-                       dtype=np.float64)
-    u_sweep = np.linspace(-margin, w + margin, n_samples,
-                          dtype=np.float64)
-    for v in v_vals:
-        pts_3d = np.empty((n_samples, 3), dtype=np.float64)
-        pts_3d[:, 0] = (u_sweep - cx) / fx
-        pts_3d[:, 1] = (v - cy) / fy
-        pts_3d[:, 2] = 1.0
-        proj, _ = cv2.projectPoints(pts_3d, rvec0, tvec0, K, D)
-        px = proj.reshape(-1, 2).astype(np.int32)
-        cv2.polylines(overlay, [px], False, (255, 220, 60), 1,
-                      cv2.LINE_AA)
-
-    # -- cross-hair at principal point --
-    cp_3d = np.array([[[0.0, 0.0, 1.0]]], dtype=np.float64)
-    cp_px, _ = cv2.projectPoints(cp_3d, rvec0, tvec0, K, D)
+    # Cross-hair at principal point.
+    cp_px, _ = cv2.projectPoints(
+        np.array([[[0.0, 0.0, 1.0]]]), rvec0, tvec0, K, D)
     cpx, cpy = int(cp_px[0, 0, 0]), int(cp_px[0, 0, 1])
-    cv2.drawMarker(overlay, (cpx, cpy), (255, 255, 100), cv2.MARKER_CROSS,
-                   20, 2, cv2.LINE_AA)
+    cv2.drawMarker(overlay, (cpx, cpy), (255, 255, 100),
+                   cv2.MARKER_CROSS, 20, 2, cv2.LINE_AA)
 
     mask = cv2.cvtColor(overlay, cv2.COLOR_BGR2GRAY)
     _, mask = cv2.threshold(mask, 1, 255, cv2.THRESH_BINARY)
@@ -258,6 +283,12 @@ def build_calib_grid_overlay(h, w, K, D, spacing=80, n_samples=200):
 
 
 def solve_plane_pose(corners_list, ids, K, D):
+    """Return (ok, R 3×3, tvec 3×1) for the tag plane, or (False, None, None).
+
+    Uses SQPNP (robust, no planar ambiguity, any N≥3 points) with an
+    ITERATIVE fallback.  Rejects solutions where the camera appears below
+    the floor (cam_pos Z ≤ 0) or the reprojection error is too large.
+    """
     obj_pts, img_pts = [], []
     for idx, tag_id in enumerate(ids.flatten().tolist()):
         if tag_id not in TAG_CENTRES:
@@ -270,12 +301,84 @@ def solve_plane_pose(corners_list, ids, K, D):
         return False, None, None
     obj_pts = np.array(obj_pts, dtype=np.float64)
     img_pts = np.array(img_pts, dtype=np.float64)
+
+    # SQPNP: modern, unambiguous solver — works well for planar + non-planar
     ok, rv, tv = cv2.solvePnP(obj_pts, img_pts, K, D,
-                               flags=cv2.SOLVEPNP_IPPE)
+                               flags=cv2.SOLVEPNP_SQPNP)
     if not ok:
         ok, rv, tv = cv2.solvePnP(obj_pts, img_pts, K, D,
                                    flags=cv2.SOLVEPNP_ITERATIVE)
-    return ok, rv, tv
+    if not ok:
+        return False, None, None
+
+    R, _ = cv2.Rodrigues(rv)
+
+    # Sanity: camera must be in front of the tags (Y < 0 in world frame)
+    # Using [1, 0] or .item() to ensure we get a scalar from the tvec array
+    cam_y = float((-R.T @ tv).ravel()[1])
+    if cam_y >= 0:
+        return False, None, None
+
+    # Sanity: reprojection error must be reasonable (< 5 px mean)
+    proj, _ = cv2.projectPoints(obj_pts, rv, tv, K, D)
+    err = float(np.mean(np.linalg.norm(
+        proj.reshape(-1, 2) - img_pts, axis=1)))
+    if err > 5.0:
+        return False, None, None
+
+    return True, R, tv
+
+
+def detect_ball(mask):
+    """Find the best circular yellow blob in a binary mask.
+
+    Returns ((cx, cy), r_px) or (None, 0).
+
+    Centre is found via distance-transform peak: the pixel furthest
+    from any blob edge.  This lands on the thickest (roundest) part of
+    the blob, which is the actual ball body even when motion blur
+    smears the mask into a long streak.  The peak value is the radius
+    of the largest inscribed circle — the ball's true radius, not the
+    half-length of the streak.
+    """
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                               cv2.CHAIN_APPROX_SIMPLE)
+    best, best_area = None, 0
+    for cnt in cnts:
+        area = cv2.contourArea(cnt)
+        if not (MIN_AREA <= area <= MAX_AREA):
+            continue
+        perim = cv2.arcLength(cnt, True)
+        if perim < 1 or FOUR_PI * area / (perim * perim) < MIN_CIRCULARITY:
+            continue
+        if area > best_area:
+            best_area, best = area, cnt
+    if best is None:
+        return None, 0
+
+    # Distance-transform peak within the contour's bounding-box ROI.
+    bx, by, bw, bh = cv2.boundingRect(best)
+    roi  = mask[by:by+bh, bx:bx+bw]
+    dist = cv2.distanceTransform(roi, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    _, r, _, loc = cv2.minMaxLoc(dist)
+    return (float(bx + loc[0]), float(by + loc[1])), r
+
+
+def ray_to_world(ball_px, K, D, R_T, cam_pos, plane_y=PLANE_Y):
+    """Unproject a distorted pixel to world XZ at y=plane_y.
+
+    Returns (x_cm, z_cm) or None if the ray misses the plane.
+    """
+    pts = np.array([[[ball_px[0], ball_px[1]]]], dtype=np.float64)
+    und = cv2.undistortPoints(pts, K, D)[0, 0]
+    rw  = R_T @ np.array([und[0], und[1], 1.0])
+    if abs(rw[1]) < 1e-8:
+        return None
+    t = (plane_y - cam_pos[1]) / rw[1]
+    if t <= 0:
+        return None
+    pt = cam_pos + t * rw
+    return (pt[0] * 100.0, pt[2] * 100.0)
 
 
 class CamReader:
@@ -304,18 +407,20 @@ class CamReader:
 
 
 def default_pose():
-    """Return a synthetic (rvec, tvec) for when no AprilTags are found.
+    """Synthetic pose: camera ~1.5 m in front of the tag wall, at floor level, looking horizontally.
 
-    Models a camera ~1.5 m above the tag-grid centre (0.5, 0.5, 0),
-    looking straight down.  World-coordinate readout will be approximate
-    but the tracker and graph still work.
+    World: X right, Y depth (+Y toward the structure), Z up.
+    Rotation Rx(+90°): camera-Y = world-(-Z), camera-Z = world(+Y)
+      → camera is level, looking along world +Y.
+    tvec corresponds to cam_pos ≈ (0.5, -1.5, 0.15) m in world.
+
+    Returns (R 3×3, tvec 3×1).
     """
-    import math
-    rvec = np.array([[math.pi], [0.0], [0.0]], dtype=np.float64)
-    # R for rvec=[π,0,0]: diag(1,-1,-1)
-    # cam_pos = (0.5, 0.5, 1.5) → tvec = -R @ cam_pos
-    tvec = np.array([[-0.5], [0.5], [1.5]], dtype=np.float64)
-    return rvec, tvec
+    R = np.array([[1.,  0.,  0.],
+                  [0.,  0., -1.],
+                  [0.,  1.,  0.]], dtype=np.float64)   # Rx(+90°)
+    tvec = np.array([[-0.5], [0.15], [1.5]], dtype=np.float64)
+    return R, tvec
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -475,6 +580,8 @@ def save_shot(base, shot_id, speed, angle, traj, all_shots):
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--cam', type=int, default=0)
+    ap.add_argument('--image', type=str, default=None,
+                    help='Load an image for one-shot calibration test')
     ap.add_argument('--calib-time', type=float, default=CALIB_DURATION)
     ap.add_argument('--show-mask', action='store_true')
     ap.add_argument('--no-graph', action='store_true',
@@ -493,91 +600,145 @@ if __name__ == '__main__':
     nt = NTInterface(team=args.team, server=args.nt_server,
                      enabled=not args.no_nt)
 
-    # ── Open camera ──
-    def open_camera(preferred=0, probe_range=6):
-        for idx in ([preferred] +
-                    [i for i in range(probe_range) if i != preferred]):
-            c = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-            if c.isOpened():
-                return c, idx
-            c.release()
-        return None, None
+    # ── Input source ──
+    if args.image:
+        cap = None
+        cam_idx = -1
+        raw_image = cv2.imread(args.image)
+        if raw_image is None:
+            raise RuntimeError(f'Could not load {args.image}')
+        actual_h, actual_w = raw_image.shape[:2]
+        print(f'Image mode: {args.image} ({actual_w}x{actual_h})')
+    else:
+        # ── Open camera ──
+        def open_camera(preferred=0, probe_range=6):
+            for idx in ([preferred] +
+                        [i for i in range(probe_range) if i != preferred]):
+                c = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+                if c.isOpened():
+                    return c, idx
+                c.release()
+            return None, None
 
-    cap, cam_idx = open_camera(args.cam)
-    if cap is None:
-        raise RuntimeError('No camera found')
-    print(f'Camera index: {cam_idx}')
+        cap, cam_idx = open_camera(args.cam)
+        if cap is None:
+            raise RuntimeError('No camera found')
+        print(f'Camera index: {cam_idx}')
 
-    cap.set(cv2.CAP_PROP_FOURCC,
-            cv2.VideoWriter.fourcc('M','J','P','G'))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    cap.set(cv2.CAP_PROP_FPS, 120)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FOURCC,
+                cv2.VideoWriter.fourcc('M','J','P','G'))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_FPS, 120)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_GAIN, 0)
 
-    actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    IMG_SIZE = (actual_w, actual_h)
-    print(f'Resolution: {actual_w}x{actual_h}  '
-          f'cam-FPS: {cap.get(cv2.CAP_PROP_FPS)}')
+        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print(f'Resolution: {actual_w}x{actual_h}  '
+              f'cam-FPS: {cap.get(cv2.CAP_PROP_FPS)}')
 
-    K = scale_K(K_CALIB, CALIB_SIZE, IMG_SIZE)
+    K = scale_K(K_CALIB, CALIB_SIZE, (actual_w, actual_h))
 
-    # ── Point-only undistortion ──
-    # The MRCAL 8-coeff → OpenCV export has 7.5 px RMS (unusable for
-    # full-frame remap).  Instead we display the raw image and
-    # undistort only the points we care about (ball centre, tag
-    # corners via solvePnP distCoeffs, grid via projectPoints).
-    print(f'[UNDISTORT] point-only mode  '
+    # Point-only undistortion: display the raw (distorted) image and
+    # undistort only the individual points we care about.
+    print(f'[CAM] {actual_w}x{actual_h}  '
           f'fx={K[0,0]:.1f} fy={K[1,1]:.1f}  '
-          f'ratio={K[0,0]/K[1,1]:.4f}')
+          f'cx={K[0,2]:.1f} cy={K[1,2]:.1f}')
 
     if USE_CUDA:
         _morph_open  = cv2.cuda.createMorphologyFilter(
             cv2.MORPH_OPEN,  cv2.CV_8UC1, MORPH_K)
         _morph_close = cv2.cuda.createMorphologyFilter(
             cv2.MORPH_CLOSE, cv2.CV_8UC1, MORPH_K)
-        _gpu_raw   = cv2.cuda.GpuMat()
-
-    print(f'K  fx={K[0,0]:.1f} fy={K[1,1]:.1f} '
-          f'cx={K[0,2]:.1f} cy={K[1,2]:.1f}')
+        _gpu_raw = cv2.cuda.GpuMat()
 
     # ── AprilTag detector (calibration only) ──
     aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_APRILTAG_16h5)
     det_params = aruco.DetectorParameters()
-    det_params.adaptiveThreshWinSizeMin  = 3
-    det_params.adaptiveThreshWinSizeMax  = 53
-    det_params.adaptiveThreshWinSizeStep = 10
-    det_params.adaptiveThreshConstant    = 7
-    det_params.minMarkerPerimeterRate    = 0.005
-    det_params.maxMarkerPerimeterRate    = 4.0
-    det_params.polygonalApproxAccuracyRate = 0.08
-    det_params.minCornerDistanceRate     = 0.005
-    det_params.minDistanceToBorder       = 0
-    det_params.cornerRefinementMethod    = aruco.CORNER_REFINE_SUBPIX
-    det_params.cornerRefinementWinSize   = 5
-    det_params.cornerRefinementMaxIterations = 50
-    det_params.cornerRefinementMinAccuracy   = 0.01
-    det_params.maxErroneousBitsInBorderRate  = 0.65
-    det_params.errorCorrectionRate           = 0.8
     detector = aruco.ArucoDetector(aruco_dict, det_params)
 
-    GRID_LINES   = build_grid_lines()
-    grid_all_pts = build_grid_pts(GRID_LINES)
+    if args.image:
+        print(f"[IMAGE] Analyzing {args.image}...")
+        img_raw = cv2.imread(args.image)
+        if img_raw is None:
+            print(f"Error: Could not read {args.image}")
+            sys.exit(1)
+        
+        corners, ids, rejected = detector.detectMarkers(img_raw)
+        if ids is not None and len(ids) > 0:
+            print(f"Found {len(ids)} markers.")
+            obj_pts = []
+            img_pts = []
+            for i in range(len(ids)):
+                tid = ids[i][0]
+                world_corners = tag_corner_world(tid)
+                if world_corners is not None:
+                    obj_pts.extend(world_corners)
+                    img_pts.extend(corners[i][0])
+            
+            obj_pts = np.array(obj_pts, dtype=np.float32)
+            img_pts = np.array(img_pts, dtype=np.float32)
+            
+            success, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, K, D_CALIB, flags=cv2.SOLVEPNP_SQPNP)
+            if success:
+                R_mat, _ = cv2.Rodrigues(rvec)
+                cam_pos = -R_mat.T @ tvec
+                
+                # Check reprojection
+                proj_pts, _ = cv2.projectPoints(obj_pts, rvec, tvec, K, D_CALIB)
+                err = np.sqrt(np.mean(np.sum((proj_pts.squeeze() - img_pts)**2, axis=1)))
+                print(f"PnP Success! Err: {err:.2f} px")
+                print(f"Cam Pos: X={cam_pos[0,0]:.3f} Y={cam_pos[1,0]:.3f} Z={cam_pos[2,0]:.3f}")
+
+                # Build overlays
+                lines = build_grid_lines()
+                overlay, mask = build_grid_overlay(actual_h, actual_w, lines, R_mat, tvec, K, D_CALIB)
+                
+                calib_overlay, calib_mask = build_calib_grid_overlay(actual_h, actual_w, K, D_CALIB)
+                
+                # Draw markers
+                aruco.drawDetectedMarkers(img_raw, corners, ids)
+                
+                # Combine
+                out = img_raw.copy()
+                # Apply blue calib grid first
+                c_mask = (calib_mask > 0)
+                out[c_mask] = cv2.addWeighted(out[c_mask], 0.5, calib_overlay[c_mask], 0.5, 0)
+                # Apply red world grid
+                w_mask = (mask > 0)
+                out[w_mask] = cv2.addWeighted(out[w_mask], 0.3, overlay[w_mask], 0.7, 0)
+                
+                cv2.imshow("Calibration Result", out)
+                print("Press any key to exit.")
+                cv2.waitKey(0)
+                sys.exit(0)
+            else:
+                print("PnP failed.")
+        else:
+            print("No markers found.")
+        sys.exit(0)
+
+    GRID_LINES = build_grid_lines()
 
     # ── Start threaded capture ──
     reader = CamReader(cap)
     time.sleep(0.1)
 
+    # ── Display window (2× upscaled) ──
+    DISPLAY_SCALE = 2
+    cv2.namedWindow('ballshots6', cv2.WINDOW_NORMAL)
+    cv2.resizeWindow('ballshots6', actual_w * DISPLAY_SCALE,
+                                   actual_h * DISPLAY_SCALE)
+
     # ── State ──
     state       = State.CALIBRATING
     nt.set_state(state)
 
-    calib_rvecs = []
-    calib_tvecs = []
+    calib_tag_data = collections.defaultdict(list) # tag_id -> list of (4,2) arrays
     calib_start = None
 
-    frozen_rvec    = None
+    frozen_R       = None   # 3×3 rotation matrix (world→camera)
     frozen_tvec    = None
     R_T_frozen     = None
     cam_pos_frozen = None
@@ -643,47 +804,64 @@ if __name__ == '__main__':
 
                 if ids is not None:
                     aruco.drawDetectedMarkers(frame, corners, ids)
-                    ok_p, rv, tv = solve_plane_pose(
-                        corners, ids, K, D_CALIB)
-                    if ok_p:
-                        calib_rvecs.append(rv.ravel().copy())
-                        calib_tvecs.append(tv.ravel().copy())
+                    for i, tid_arr in enumerate(ids):
+                        tid = int(tid_arr[0])
+                        calib_tag_data[tid].append(corners[i][0])
 
-                n = len(calib_rvecs)
+                # Count unique tags seen so far
+                n_tags = len(calib_tag_data)
+                # Count total detections across all tags
+                total_dets = sum(len(v) for v in calib_tag_data.values())
+
                 cv2.putText(frame,
-                    f'CALIBRATING  {remaining:.1f}s  poses:{n}',
+                    f'CALIBRATING  {remaining:.1f}s  tags:{n_tags} dets:{total_dets}',
                     (20, 40), cv2.FONT_HERSHEY_SIMPLEX,
                     0.9, (0, 180, 255), 2)
 
                 if elapsed >= CALIB_DURATION:
-                    if n > 0:
-                        frozen_rvec = np.median(
-                            calib_rvecs, axis=0).reshape(3, 1)
-                        frozen_tvec = np.median(
-                            calib_tvecs, axis=0).reshape(3, 1)
-                        print(f'[CALIB] LOCKED from {n} poses')
+                    if n_tags > 0:
+                        # Average pixel coordinates for each tag
+                        avg_corners = []
+                        avg_ids = []
+                        for tid, corner_list in calib_tag_data.items():
+                            if len(corner_list) > 0:
+                                # Mean of (N, 4, 2) array over axis 0
+                                mean_corner = np.mean(corner_list, axis=0)
+                                # solve_plane_pose expects (1, 4, 2) shaped corners per tag
+                                avg_corners.append(mean_corner.reshape(1, 4, 2).astype(np.float32))
+                                avg_ids.append([tid])
+                        
+                        avg_ids = np.array(avg_ids, dtype=np.int32)
+                        
+                        ok_p, R_pose, tv = solve_plane_pose(
+                            avg_corners, avg_ids, K, D_CALIB)
+                        
+                        if ok_p:
+                            frozen_R = R_pose
+                            frozen_tvec = tv
+                            print(f'[CALIB] LOCKED from average of {total_dets} detections')
+                        else:
+                            frozen_R, frozen_tvec = default_pose()
+                            print('[CALIB] PnP failed on averaged corners — using default pose')
                     else:
-                        frozen_rvec, frozen_tvec = default_pose()
+                        frozen_R, frozen_tvec = default_pose()
                         print('[CALIB] No tags found — using default '
                               'pose (not-to-scale)')
 
-                    proj, _ = cv2.projectPoints(
-                        grid_all_pts, frozen_rvec, frozen_tvec,
-                        K, D_CALIB)
-                    grid_px = proj.reshape(-1, 2).astype(np.int32)
-                    R, _ = cv2.Rodrigues(frozen_rvec)
-                    R_T_frozen = R.T.astype(np.float64, copy=True)
+                    R_T_frozen = frozen_R.T.astype(np.float64, copy=True)
                     cam_pos_frozen = (
                         -R_T_frozen @ frozen_tvec).ravel().copy()
                     grid_overlay, grid_mask_img = \
                         build_grid_overlay(actual_h, actual_w,
-                                           grid_px, GRID_LINES)
+                                           GRID_LINES,
+                                           frozen_R, frozen_tvec, K, D_CALIB)
                     calib_grid_overlay, calib_grid_mask_img = \
                         build_calib_grid_overlay(actual_h, actual_w,
                                                  K, D_CALIB)
                     print(f'[CALIB] cam=({cam_pos_frozen[0]:.3f},'
-                          f'{cam_pos_frozen[1]:.3f},'
-                          f'{cam_pos_frozen[2]:.3f})')
+                          f' {cam_pos_frozen[1]:.3f},'
+                          f' {cam_pos_frozen[2]:.3f}) m'
+                          f'  [Z should be > 0 = above floor]')
                     state = State.WAITING
                     nt.set_state(state)
                     nt.set_ok_to_shoot(True)
@@ -725,57 +903,17 @@ if __name__ == '__main__':
                 mask  = mask_u.get()
 
             # ── Contour detection ──
-            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-            ball_px = None
-            ball_area = 0
-            if cnts:
-                best_cnt  = None
-                best_area = 0
-                for cnt in cnts:
-                    area = cv2.contourArea(cnt)
-                    if area < MIN_AREA or area > MAX_AREA:
-                        continue
-                    perim = cv2.arcLength(cnt, True)
-                    if perim < 1:
-                        continue
-                    circ = FOUR_PI * area / (perim * perim)
-                    if circ < MIN_CIRCULARITY:
-                        continue
-                    if area > best_area:
-                        best_area = area
-                        best_cnt  = cnt
-                if best_cnt is not None:
-                    (bx, by), r_px = cv2.minEnclosingCircle(best_cnt)
-                    ball_px = (bx, by)
-                    ball_area = best_area
-                    cv2.circle(frame, (int(bx), int(by)),
-                               int(r_px), (0, 255, 0), 2)
-                    cv2.circle(frame, (int(bx), int(by)),
-                               3, (0, 0, 255), -1)
-
-            # ── Ray → world (undistort point, then cast) ──
-            world_xy = None
+            ball_px, ball_r = detect_ball(mask)
             if ball_px is not None:
-                # undistortPoints with K + D_CALIB → normalised coords
-                _pts = np.array([[[ball_px[0], ball_px[1]]]],
-                                dtype=np.float64)
-                _und = cv2.undistortPoints(_pts, K, D_CALIB)
-                rcx = _und[0, 0, 0]
-                rcy = _und[0, 0, 1]
-                rw0 = (R_T_frozen[0,0]*rcx + R_T_frozen[0,1]*rcy
-                       + R_T_frozen[0,2])
-                rw1 = (R_T_frozen[1,0]*rcx + R_T_frozen[1,1]*rcy
-                       + R_T_frozen[1,2])
-                rw2 = (R_T_frozen[2,0]*rcx + R_T_frozen[2,1]*rcy
-                       + R_T_frozen[2,2])
-                if abs(rw2) > 1e-8:
-                    t = -cam_pos_frozen[2] / rw2
-                    if t > 0:
-                        world_xy = (
-                            (cam_pos_frozen[0] + t * rw0) * 100.0,
-                            (cam_pos_frozen[1] + t * rw1) * 100.0,
-                        )
+                cv2.circle(frame, (int(ball_px[0]), int(ball_px[1])),
+                           int(ball_r), (0, 255, 0), 2)
+                cv2.circle(frame, (int(ball_px[0]), int(ball_px[1])),
+                           3, (0, 0, 255), -1)
+
+            # ── Ray → world ──
+            world_xy = (ray_to_world(ball_px, K, D_CALIB,
+                                     R_T_frozen, cam_pos_frozen)
+                        if ball_px is not None else None)
 
             now_t = time.time()
 
@@ -894,8 +1032,8 @@ if __name__ == '__main__':
             # ── Grid overlay ──
             np.copyto(frame, calib_grid_overlay,
                       where=calib_grid_mask_img[:, :, None] > 0)
-            # np.copyto(frame, grid_overlay,
-            #           where=grid_mask_img[:, :, None] > 0)
+            np.copyto(frame, grid_overlay,
+                      where=grid_mask_img[:, :, None] > 0)
 
             # ── HUD ──
             now_pc = time.perf_counter()

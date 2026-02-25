@@ -1,21 +1,31 @@
 """
-ballshots6 — NT-coordinated ball-shot tracker.
+ballshots7 — NT-coordinated ball-shot tracker.
+
+Key changes from ballshots7:
+  - AprilTag detector: quad_decimate=1.0, nthreads=4
+    (was 2.0 — downscaling prevented tag 1 from being detected)
+  - K matrix crop correction: cx adjusted for live-frame crop offset
+  - New --test-dir mode: batch test AprilTag detection on a directory of images
+  - New --no-crop flag: disable the 20%/20% frame crop in live mode
 
 See protocol.md for the full NetworkTables handshake.
 
 Usage:
-    python ballshots6.py                        # connect to team 41 roboRIO
-    python ballshots6.py --nt-server 10.0.41.2  # explicit server IP
-    python ballshots6.py --no-nt                 # standalone (no NT)
-    python ballshots6.py --show-mask             # show HSV debug window
+    python ballshots7.py                         # connect to team 41 roboRIO
+    python ballshots7.py --nt-server 10.0.41.2   # explicit server IP
+    python ballshots7.py --no-nt                  # standalone (no NT)
+    python ballshots7.py --show-mask              # show HSV debug window
+    python ballshots7.py --test-dir testshots/    # batch AprilTag test on images
 """
-import argparse, time, json, os, threading, enum, collections, sys
+import argparse, time, json, os, threading, enum, sys
 import cv2
 import numpy as np
 from pupil_apriltags import Detector
-import matplotlib
-matplotlib.use('TkAgg')
-import matplotlib.pyplot as plt
+from calib_utils import (
+    TAG_CENTRES, PLANE_Y, GRID_MINOR, GRID_MAJOR, GRID_EXTENT,
+    scale_K, tag_corner_world, default_pose, solve_plane_pose,
+    build_grid_lines, build_grid_overlay, build_calib_grid_overlay,
+)
 
 # ── GPU back-end selection ──
 USE_CUDA = False
@@ -47,34 +57,8 @@ D_CALIB = np.array([
     -0.03301555724510292, -0.007126953259440723])
 CALIB_SIZE = (1280, 720)
 
-# ── Tag layout (metres) ──
-# World frame: X right, Y depth (+Y toward the shooter structure), Z up.
-# Tags are on a VERTICAL face (XZ plane, Y ≈ 0).
-# Layout:
-#   Tag 0 (top-left)  ──────  Tag 1 (top-right)
-#   Tag 2 (bot-left)  ──────  Tag 3 (bot-right)
-#
-# Horizontal separation (tag-centre to tag-centre): TAG_SPACING_H = 1.0 m
-# Vertical   separation (tag-centre to tag-centre): TAG_SPACING_V = 1.0 m
-# Bottom-tag height above floor: half of US letter paper (11 in / 2 = 5.5 in = 0.1397 m)
-TAG_SIZE      = 0.2           # marker side length (metres) — 4 inches
-TAG_SPACING_H = 1.0                 # horizontal centre-to-centre (metres)
-TAG_SPACING_V = 1.0                 # vertical   centre-to-centre (metres)
-TAG_Z_BOTTOM  = (11 * 0.0254) / 2  # = 0.1397 m — bottom-tag Z height
-TAG_CENTRES = {
-    0: np.array([0.0,          0.0, TAG_Z_BOTTOM + TAG_SPACING_V]),  # top-left
-    1: np.array([TAG_SPACING_H, 0.0, TAG_Z_BOTTOM + TAG_SPACING_V]),  # top-right
-    2: np.array([0.0,          0.0, TAG_Z_BOTTOM]),                   # bot-left
-    3: np.array([TAG_SPACING_H, 0.0, TAG_Z_BOTTOM]),                  # bot-right
-}
-
-# ── Grid (metres) ──
-GRID_MINOR = 0.25          # quarter-metre lines (dotted)
-GRID_MAJOR = 1.0           # full-metre lines (solid)
-GRID_EXTENT = 6.0          # ±3 m from origin
-
 # ── Ball detection ──
-LO_YELLOW = np.array([25, 100, 100], dtype=np.uint8)
+LO_YELLOW = np.array([25, 110, 130], dtype=np.uint8)
 HI_YELLOW = np.array([35, 255, 255], dtype=np.uint8)
 MORPH_K   = np.ones((5, 5), np.uint8)
 
@@ -87,14 +71,9 @@ MAX_AREA          = 60000
 MIN_CIRCULARITY   = 0.4
 FOUR_PI           = 4.0 * np.pi
 
-# ── Graph ──
-GRAPH_WINDOW      = 10.0    # seconds of history shown
-GRAPH_UPDATE_INTERVAL = 0.15  # seconds between plot refreshes
-
 # ── Calibration ──
-CALIB_DURATION = 10.0
-# PLANE_Y        = -1.0  # world Y (metres from tags) for ball-tracking plane intersection
-PLANE_Y        = -1.0  # world Y (metres from tags) for ball-tracking plane intersection
+CALIB_DURATION = 5.0
+PLANE_Y        = -0.3  # world Y (metres from tags) for ball-tracking plane intersection
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -112,248 +91,6 @@ class State(enum.Enum):
 # ═══════════════════════════════════════════════════════════════════════════
 #  HELPERS
 # ═══════════════════════════════════════════════════════════════════════════
-def scale_K(K_orig, orig_size, new_size):
-    sx = new_size[0] / orig_size[0]
-    sy = new_size[1] / orig_size[1]
-    K = K_orig.copy()
-    K[0, 0] *= sx;  K[0, 2] *= sx
-    K[1, 1] *= sy;  K[1, 2] *= sy
-    return K
-
-
-def tag_corner_world(tag_id):
-    """World coords of the 4 corners for tag_id.
-
-    Tags are on a VERTICAL face (world XZ plane, Y ≈ 0).
-    World: X right, Z up.
-
-    _detect_tags reindexes pupil corners [3,2,1,0], so they arrive in
-    image order: TL, TR, BR, BL.  For upright (non-rotated) markers:
-      0: top-left     → (-s, 0, +s)   ← image TL
-      1: top-right    → (+s, 0, +s)   ← image TR
-      2: bottom-right → (+s, 0, -s)   ← image BR
-      3: bottom-left  → (-s, 0, -s)   ← image BL
-    """
-    c = TAG_CENTRES[tag_id]
-    s = TAG_SIZE / 2.0
-    return np.array([
-        c + [-s, 0, +s],   # corner 0: image top-left
-        c + [+s, 0, +s],   # corner 1: image top-right
-        c + [+s, 0, -s],   # corner 2: image bottom-right
-        c + [-s, 0, -s],   # corner 3: image bottom-left
-    ], dtype=np.float64)
-
-
-def build_grid_lines():
-    """Return list of (p0, p1, is_major) for the vertical tracking plane.
-    
-    The plane is at Y = PLANE_Y, spanning X from -EXTENT to +EXTENT 
-    and Z from 0 (floor) to +EXTENT.
-    """
-    lines = []
-    n_steps = int(GRID_EXTENT / GRID_MINOR)
-    for i in range(-n_steps, n_steps + 1):
-        coord = i * GRID_MINOR
-        major = (abs(coord % GRID_MAJOR) < 1e-6 or
-                 abs(coord % GRID_MAJOR - GRID_MAJOR) < 1e-6)
-        
-        # Horizontal lines (parallel to X axis, at constant Z)
-        # Only draw if Z >= 0
-        if coord >= 0:
-            lines.append((np.array([-GRID_EXTENT, PLANE_Y, coord]),
-                           np.array([ GRID_EXTENT, PLANE_Y, coord]), major))
-        
-        # Vertical lines (parallel to Z axis, at constant X)
-        lines.append((np.array([coord, PLANE_Y, 0.0]),
-                       np.array([coord, PLANE_Y, GRID_EXTENT]), major))
-    return lines
-
-
-def _draw_dashed_line(img, pt1, pt2, color, thickness=1,
-                      dash=8, gap=6):
-    """Draw a dashed line on img between pt1 and pt2."""
-    x1, y1 = pt1
-    x2, y2 = pt2
-    dx = x2 - x1
-    dy = y2 - y1
-    length = (dx*dx + dy*dy) ** 0.5
-    if length < 1:
-        return
-    ux = dx / length
-    uy = dy / length
-    d = 0.0
-    while d < length:
-        sx = int(x1 + ux * d)
-        sy = int(y1 + uy * d)
-        d2 = min(d + dash, length)
-        ex = int(x1 + ux * d2)
-        ey = int(y1 + uy * d2)
-        cv2.line(img, (sx, sy), (ex, ey), color, thickness, cv2.LINE_4)
-        d += dash + gap
-
-
-def build_grid_overlay(h, w, grid_lines, R, tvec, K, D):
-    """Build the world-space grid overlay in distorted pixel space.
-
-    Projects world-space grid lines (subdivided) using K and D so that
-    they follow the lens distortion of the raw frame.
-    XYZ axis arrows are rendered in blue/green/red.
-    """
-    overlay = np.zeros((h, w, 3), dtype=np.uint8)
-    rvec, _ = cv2.Rodrigues(R)
-    M = 2000
-    subdiv = 200  # points per line segment
-
-    # ── Grid lines ──
-    for p0, p1, is_major in grid_lines:
-        # Subdivide line for smooth distortion curves
-        pts_w = np.array([p0 + (p1 - p0) * t for t in np.linspace(0, 1, subdiv)], dtype=np.float64)
-        proj, _ = cv2.projectPoints(pts_w, rvec, tvec, K, D)
-        px = proj.reshape(-1, 2).astype(np.int32)
-
-        # Check if line is at least partially in view
-        in_view = np.any((px[:, 0] >= -M) & (px[:, 0] <= w+M) & 
-                         (px[:, 1] >= -M) & (px[:, 1] <= h+M))
-        if not in_view:
-            continue
-
-        color = (0, 0, 200) if is_major else (0, 0, 120)
-        if is_major:
-            cv2.polylines(overlay, [px], False, color, 1, cv2.LINE_4)
-        else:
-            # For dashed lines, we just draw the segments
-            for j in range(0, subdiv - 1, 2):
-                cv2.line(overlay, tuple(px[j]), tuple(px[j+1]), color, 1, cv2.LINE_4)
-
-    # ── Axis arrows (straight segments are fine for small axis markers) ──
-    axis_pts = np.array([
-        [0, 0, 0], [1, 0, 0],   # X
-        [0, 0, 0], [0, 1, 0],   # Y
-        [0, 0, 0], [0, 0, 0.5]  # Z
-    ], dtype=np.float64)
-    proj_axis, _ = cv2.projectPoints(axis_pts, rvec, tvec, K, D)
-    px_axis = proj_axis.reshape(-1, 2).astype(np.int32)
-    
-    for a, col in enumerate([(0, 0, 255), (0, 255, 0), (255, 0, 0)]):
-        cv2.line(overlay, tuple(px_axis[a*2]), tuple(px_axis[a*2+1]), col, 2, cv2.LINE_4)
-
-    mask = cv2.cvtColor(overlay, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(mask, 1, 255, cv2.THRESH_BINARY)
-    return overlay, mask
-
-
-def build_calib_grid_overlay(h, w, K, D, spacing=80, n_samples=200):
-    """Grid regular in *undistorted* pixel space, projected through distortion.
-
-    Shows how the calibration model warps a perfectly uniform grid —
-    lines are straight at the centre and curve toward the edges.
-    """
-    fx, fy = K[0, 0], K[1, 1]
-    cx, cy = K[0, 2], K[1, 2]
-    rvec0 = tvec0 = np.zeros((3, 1), dtype=np.float64)
-    overlay = np.zeros((h, w, 3), dtype=np.uint8)
-    margin = int(max(w, h) * 2)
-    sweep = np.linspace(-margin, max(w, h) + margin, n_samples, dtype=np.float64)
-
-    # horiz=False → vertical lines (u fixed, v sweeps)
-    # horiz=True  → horizontal lines (v fixed, u sweeps)
-    for horiz in (False, True):
-        size   = h if horiz else w
-        coords = np.arange(-margin, size + margin + 1, spacing, dtype=np.float64)
-        for coord in coords:
-            pts = np.empty((n_samples, 3), dtype=np.float64)
-            pts[:, 0] = (sweep - cx) / fx if horiz else (coord - cx) / fx
-            pts[:, 1] = (coord - cy) / fy if horiz else (sweep - cy) / fy
-            pts[:, 2] = 1.0
-            proj, _ = cv2.projectPoints(pts, rvec0, tvec0, K, D)
-            cv2.polylines(overlay, [proj.reshape(-1, 2).astype(np.int32)],
-                          False, (255, 220, 60), 1, cv2.LINE_AA)
-
-    # Cross-hair at principal point.
-    cp_px, _ = cv2.projectPoints(
-        np.array([[[0.0, 0.0, 1.0]]]), rvec0, tvec0, K, D)
-    cpx, cpy = int(cp_px[0, 0, 0]), int(cp_px[0, 0, 1])
-    cv2.drawMarker(overlay, (cpx, cpy), (255, 255, 100),
-                   cv2.MARKER_CROSS, 20, 2, cv2.LINE_AA)
-
-    mask = cv2.cvtColor(overlay, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(mask, 1, 255, cv2.THRESH_BINARY)
-    return overlay, mask
-
-
-def solve_plane_pose(corners_list, ids, K, D):
-    """Return (ok, R 3×3, tvec 3×1) for the tag plane, or (False, None, None).
-
-    Tries three solvers in order:
-      1. SQPNP          — modern, handles planar configs well
-      2. ITERATIVE      — warm-started from default_pose() to avoid mirror solutions
-      3. ITERATIVE      — cold start (last resort)
-    Rejects solutions where cam_y ≥ 0 (camera behind tags) or reproj > 5 px.
-    """
-    obj_pts, img_pts = [], []
-    for idx, tag_id in enumerate(ids.flatten().tolist()):
-        if tag_id not in TAG_CENTRES:
-            continue
-        wc = tag_corner_world(tag_id)
-        ic = corners_list[idx].reshape(4, 2)
-        for w, p in zip(wc, ic):
-            obj_pts.append(w); img_pts.append(p)
-    if len(obj_pts) < 4:
-        return False, None, None
-    obj_pts = np.array(obj_pts, dtype=np.float64)
-    img_pts = np.array(img_pts, dtype=np.float64)
-
-    # Warm-start guess: camera ~1.5 m in front of tag wall, level
-    R0, tv0 = default_pose()
-    rv0, _ = cv2.Rodrigues(R0)
-
-    solver_names = {
-        cv2.SOLVEPNP_SQPNP:    'SQPNP',
-        cv2.SOLVEPNP_ITERATIVE: 'ITER',
-    }
-    attempts = [
-        (cv2.SOLVEPNP_SQPNP,    None,       None,        False),
-        (cv2.SOLVEPNP_ITERATIVE, rv0.copy(), tv0.copy(),  True),
-        (cv2.SOLVEPNP_ITERATIVE, None,       None,        False),
-    ]
-    for flags, init_rv, init_tv, use_guess in attempts:
-        label = solver_names[flags] + ('+guess' if use_guess else '')
-        if use_guess:
-            ok, rv, tv = cv2.solvePnP(
-                obj_pts, img_pts, K, D,
-                rvec=init_rv, tvec=init_tv,
-                useExtrinsicGuess=True, flags=flags)
-        else:
-            ok, rv, tv = cv2.solvePnP(obj_pts, img_pts, K, D, flags=flags)
-        if not ok:
-            print(f'[PnP/{label}] solver returned False')
-            continue
-
-        R, _ = cv2.Rodrigues(rv)
-        cam_pos_w = (-R.T @ tv).ravel()
-        cam_y = float(cam_pos_w[1])
-
-        proj, _ = cv2.projectPoints(obj_pts, rv, tv, K, D)
-        err = float(np.mean(np.linalg.norm(
-            proj.reshape(-1, 2) - img_pts, axis=1)))
-
-        print(f'[PnP/{label}] npts={len(obj_pts)}'
-              f'  cam=({cam_pos_w[0]:.3f}, {cam_y:.3f}, {cam_pos_w[2]:.3f}) m'
-              f'  reproj={err:.2f} px', end='')
-
-        if cam_y >= 0:
-            print('  → REJECT (cam behind tags)')
-            continue
-        # if err > 5.0:
-            # print('  → REJECT (reproj > 5 px)')
-            # continue
-
-        print('  → OK')
-        return True, R, tv
-
-    return False, None, None
-
-
 def detect_ball(mask):
     """Find the best circular yellow blob in a binary mask.
 
@@ -607,18 +344,22 @@ if __name__ == '__main__':
     ap.add_argument('--cam', type=int, default=0)
     ap.add_argument('--image', type=str, default=None,
                     help='Load an image for one-shot calibration test')
+    ap.add_argument('--test-dir', type=str, default=None,
+                    help='Batch test AprilTag detection on all JPGs in a directory')
     ap.add_argument('--calib-time', type=float, default=CALIB_DURATION)
     ap.add_argument('--show-mask', action='store_true')
-    ap.add_argument('--no-graph', action='store_true',
-                    help='Disable live matplotlib graph')
     ap.add_argument('--no-nt', action='store_true',
                     help='Disable NetworkTables (standalone mode)')
     ap.add_argument('--nt-server', type=str, default=None,
                     help='NT server IP (default: auto team 41)')
     ap.add_argument('--team', type=int, default=41)
+    ap.add_argument('--no-crop', action='store_true',
+                    help='Disable live frame crop mask (20%% sides, 20%% bottom)')
     args = ap.parse_args()
     CALIB_DURATION = args.calib_time
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+    VIDEO_DIR = os.path.join(BASE_DIR, 'videos')
+    os.makedirs(VIDEO_DIR, exist_ok=True)
     all_shots = load_shots(BASE_DIR)
 
     # ── NetworkTables ──
@@ -659,8 +400,11 @@ if __name__ == '__main__':
 
         actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cam_fps  = cap.get(cv2.CAP_PROP_FPS)
+        if cam_fps <= 0:
+            cam_fps = 30.0
         print(f'Resolution: {actual_w}x{actual_h}  '
-              f'cam-FPS: {cap.get(cv2.CAP_PROP_FPS)}')
+              f'cam-FPS: {cam_fps:.0f}')
 
     K = scale_K(K_CALIB, CALIB_SIZE, (actual_w, actual_h))
 
@@ -678,7 +422,9 @@ if __name__ == '__main__':
         _gpu_raw = cv2.cuda.GpuMat()
 
     # ── AprilTag detector (calibration only) ──
-    detector = Detector(families='tag16h5', nthreads=2)
+    # quad_decimate=1.0: no downscaling — required to detect all 4 tags reliably.
+    # Default quad_decimate=2.0 causes tag 1 to be missed due to resolution loss.
+    detector = Detector(families='tag16h5', nthreads=4, quad_decimate=1.0)
     MIN_DECISION_MARGIN = 20  # raise to reject more uncertain detections
     VALID_TAG_IDS = set(TAG_CENTRES.keys())  # {0, 1, 2, 3}
 
@@ -713,66 +459,104 @@ if __name__ == '__main__':
             cv2.putText(img, str(ids[i][0]), (cx - 10, cy),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
+    def _annotate_image(img_raw, K_img, label=''):
+        """Detect tags + PnP on one image; return annotated copy."""
+        ih, iw = img_raw.shape[:2]
+        gray = cv2.cvtColor(img_raw, cv2.COLOR_BGR2GRAY)
+        corners, ids = _detect_tags(gray)
+        out = img_raw.copy()
+
+        if ids is None or len(ids) == 0:
+            cv2.putText(out, 'NO TAGS', (10, ih - 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            if label:
+                cv2.putText(out, label, (10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 100), 1)
+            return out
+
+        _draw_tags(out, corners, ids)
+        detected_ids = sorted(ids.flatten().tolist())
+
+        ok_p, R_mat, tvec = solve_plane_pose(corners, ids, K_img, D_CALIB)
+        if ok_p:
+            # Reprojection error
+            obj_pts, img_pts = [], []
+            for i, tid in enumerate(ids.flatten().tolist()):
+                if tid in TAG_CENTRES:
+                    obj_pts.extend(tag_corner_world(tid))
+                    img_pts.extend(corners[i].reshape(4, 2))
+            rvec, _ = cv2.Rodrigues(R_mat)
+            proj, _ = cv2.projectPoints(
+                np.array(obj_pts, dtype=np.float64), rvec, tvec, K_img, D_CALIB)
+            err = float(np.mean(np.linalg.norm(
+                proj.reshape(-1, 2) - np.array(img_pts), axis=1)))
+            cam_pos = (-R_mat.T @ tvec).ravel()
+
+            # Grid overlays
+            lines = build_grid_lines()
+            grid_ov, grid_mk = build_grid_overlay(ih, iw, lines, R_mat, tvec, K_img, D_CALIB)
+            calib_ov, calib_mk = build_calib_grid_overlay(ih, iw, K_img, D_CALIB)
+            out[calib_mk > 0] = cv2.addWeighted(
+                out[calib_mk > 0], 0.5, calib_ov[calib_mk > 0], 0.5, 0)
+            out[grid_mk > 0] = cv2.addWeighted(
+                out[grid_mk > 0], 0.3, grid_ov[grid_mk > 0], 0.7, 0)
+
+            msg = (f'IDs:{detected_ids}  reproj={err:.2f}px'
+                   f'  cam=({cam_pos[0]:.2f},{cam_pos[1]:.2f},{cam_pos[2]:.2f})m')
+            color = (0, 255, 200)
+            print(f'  {label}  {msg}')
+        else:
+            msg = f'IDs:{detected_ids}  PnP FAILED'
+            color = (0, 80, 255)
+            print(f'  {label}  {msg}')
+
+        cv2.putText(out, msg, (10, ih - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        if label:
+            cv2.putText(out, label, (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 100), 1)
+        return out
+
+    # ── --test-dir: step through images, SPACE/B=next/prev, Q=quit ───────
+    if args.test_dir:
+        import glob as _glob
+        test_images = sorted(
+            _glob.glob(os.path.join(args.test_dir, '*.jpg')) +
+            _glob.glob(os.path.join(args.test_dir, '*.png')))
+        if not test_images:
+            print(f'No images found in {args.test_dir}')
+            sys.exit(1)
+        print(f'[TEST-DIR] {len(test_images)} images  SPACE=next  B=back  Q=quit')
+        cv2.namedWindow('ballshots7-test', cv2.WINDOW_NORMAL)
+        idx = 0
+        while True:
+            path = test_images[idx]
+            img_raw = cv2.imread(path)
+            K_img = scale_K(K_CALIB, CALIB_SIZE,
+                            (img_raw.shape[1], img_raw.shape[0]))
+            label = f'[{idx+1}/{len(test_images)}] {os.path.basename(path)}'
+            cv2.imshow('ballshots7-test', _annotate_image(img_raw, K_img, label))
+            k = cv2.waitKey(0) & 0xFF
+            if k in (ord('q'), 27):
+                break
+            elif k in (ord('b'), 81):
+                idx = (idx - 1) % len(test_images)
+            else:
+                idx = (idx + 1) % len(test_images)
+        cv2.destroyAllWindows()
+        sys.exit(0)
+
+    # ── --image: single image ─────────────────────────────────────────────
     if args.image:
-        print(f"[IMAGE] Analyzing {args.image}...")
         img_raw = cv2.imread(args.image)
         if img_raw is None:
-            print(f"Error: Could not read {args.image}")
+            print(f'Cannot read {args.image}')
             sys.exit(1)
-        
-        gray_img = cv2.cvtColor(img_raw, cv2.COLOR_BGR2GRAY)
-        corners, ids = _detect_tags(gray_img)
-        if ids is not None and len(ids) > 0:
-            print(f"Found {len(ids)} markers.")
-            obj_pts = []
-            img_pts = []
-            for i in range(len(ids)):
-                tid = ids[i][0]
-                world_corners = tag_corner_world(tid)
-                if world_corners is not None:
-                    obj_pts.extend(world_corners)
-                    img_pts.extend(corners[i][0])
-            
-            obj_pts = np.array(obj_pts, dtype=np.float32)
-            img_pts = np.array(img_pts, dtype=np.float32)
-            
-            success, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, K, D_CALIB, flags=cv2.SOLVEPNP_SQPNP)
-            if success:
-                R_mat, _ = cv2.Rodrigues(rvec)
-                cam_pos = -R_mat.T @ tvec
-                
-                # Check reprojection
-                proj_pts, _ = cv2.projectPoints(obj_pts, rvec, tvec, K, D_CALIB)
-                err = np.sqrt(np.mean(np.sum((proj_pts.squeeze() - img_pts)**2, axis=1)))
-                print(f"PnP Success! Err: {err:.2f} px")
-                print(f"Cam Pos: X={cam_pos[0,0]:.3f} Y={cam_pos[1,0]:.3f} Z={cam_pos[2,0]:.3f}")
-
-                # Build overlays
-                lines = build_grid_lines()
-                overlay, mask = build_grid_overlay(actual_h, actual_w, lines, R_mat, tvec, K, D_CALIB)
-                
-                calib_overlay, calib_mask = build_calib_grid_overlay(actual_h, actual_w, K, D_CALIB)
-                
-                # Draw markers
-                _draw_tags(img_raw, corners, ids)
-                
-                # Combine
-                out = img_raw.copy()
-                # Apply blue calib grid first
-                c_mask = (calib_mask > 0)
-                out[c_mask] = cv2.addWeighted(out[c_mask], 0.5, calib_overlay[c_mask], 0.5, 0)
-                # Apply red world grid
-                w_mask = (mask > 0)
-                out[w_mask] = cv2.addWeighted(out[w_mask], 0.3, overlay[w_mask], 0.7, 0)
-                
-                cv2.imshow("Calibration Result", out)
-                print("Press any key to exit.")
-                cv2.waitKey(0)
-                sys.exit(0)
-            else:
-                print("PnP failed.")
-        else:
-            print("No markers found.")
+        K_img = scale_K(K_CALIB, CALIB_SIZE, (img_raw.shape[1], img_raw.shape[0]))
+        cv2.namedWindow('ballshots7-image', cv2.WINDOW_NORMAL)
+        cv2.imshow('ballshots7-image',
+                   _annotate_image(img_raw, K_img, os.path.basename(args.image)))
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
         sys.exit(0)
 
     GRID_LINES = build_grid_lines()
@@ -783,18 +567,18 @@ if __name__ == '__main__':
 
     # ── Display window (2× upscaled) ──
     DISPLAY_SCALE = 2
-    cv2.namedWindow('ballshots6', cv2.WINDOW_NORMAL)
-    cv2.resizeWindow('ballshots6', actual_w * DISPLAY_SCALE,
+    cv2.namedWindow('ballshots7', cv2.WINDOW_NORMAL)
+    cv2.resizeWindow('ballshots7', actual_w * DISPLAY_SCALE,
                                    actual_h * DISPLAY_SCALE)
 
     # ── HSV tuner trackbars (--show-mask only) ──
     if args.show_mask:
-        cv2.createTrackbar('H lo',  'ballshots6', int(LO_YELLOW[0]), 179, lambda v: LO_YELLOW.__setitem__(0, v))
-        cv2.createTrackbar('H hi',  'ballshots6', int(HI_YELLOW[0]), 179, lambda v: HI_YELLOW.__setitem__(0, v))
-        cv2.createTrackbar('S lo',  'ballshots6', int(LO_YELLOW[1]), 255, lambda v: LO_YELLOW.__setitem__(1, v))
-        cv2.createTrackbar('S hi',  'ballshots6', int(HI_YELLOW[1]), 255, lambda v: HI_YELLOW.__setitem__(1, v))
-        cv2.createTrackbar('V lo',  'ballshots6', int(LO_YELLOW[2]), 255, lambda v: LO_YELLOW.__setitem__(2, v))
-        cv2.createTrackbar('V hi',  'ballshots6', int(HI_YELLOW[2]), 255, lambda v: HI_YELLOW.__setitem__(2, v))
+        cv2.createTrackbar('H lo',  'ballshots7', int(LO_YELLOW[0]), 179, lambda v: LO_YELLOW.__setitem__(0, v))
+        cv2.createTrackbar('H hi',  'ballshots7', int(HI_YELLOW[0]), 179, lambda v: HI_YELLOW.__setitem__(0, v))
+        cv2.createTrackbar('S lo',  'ballshots7', int(LO_YELLOW[1]), 255, lambda v: LO_YELLOW.__setitem__(1, v))
+        cv2.createTrackbar('S hi',  'ballshots7', int(HI_YELLOW[1]), 255, lambda v: HI_YELLOW.__setitem__(1, v))
+        cv2.createTrackbar('V lo',  'ballshots7', int(LO_YELLOW[2]), 255, lambda v: LO_YELLOW.__setitem__(2, v))
+        cv2.createTrackbar('V hi',  'ballshots7', int(HI_YELLOW[2]), 255, lambda v: HI_YELLOW.__setitem__(2, v))
         print('[MASK] Trackbars active — press Q to quit and print final values')
 
     # ── State ──
@@ -814,6 +598,8 @@ if __name__ == '__main__':
     calib_grid_mask_img = None
 
     shot_count     = 0
+    video_writer   = None        # cv2.VideoWriter for current shot
+    video_path     = None
     cur_traj       = []          # current shot trajectory
     traj_start_py  = 0.0         # pixel-Y when ball first detected
     traj_peaked    = False       # has ball risen ≥ MIN_RISE_PX?
@@ -827,23 +613,6 @@ if __name__ == '__main__':
     fps_val  = 0.0
     frame_n  = 0
 
-    # ── Live graph ──
-    use_graph = not args.no_graph
-    graph_times = collections.deque()   # perf_counter timestamps
-    graph_ys    = collections.deque()   # world Y in metres
-    graph_last_update = 0.0
-    if use_graph:
-        plt.ion()
-        graph_fig, graph_ax = plt.subplots(figsize=(7, 3))
-        graph_fig.canvas.manager.set_window_title('Ball Y — last 10 s')
-        graph_line, = graph_ax.plot([], [], 'b-', linewidth=1.5)
-        graph_ax.set_xlabel('Time (s)')
-        graph_ax.set_ylabel('Y position (m)')
-        graph_ax.set_title('Live Ball Y Position')
-        graph_ax.grid(True, alpha=0.3)
-        graph_fig.tight_layout()
-        graph_fig.show()
-
     try:
         while True:
             ok, raw = reader.read()
@@ -852,12 +621,17 @@ if __name__ == '__main__':
             frame_n += 1
 
             # ── Raw frame (no remap — point-only undistortion) ──
-            # Crop: remove 20% left/right, 20% bottom
-            _h, _w = raw.shape[:2]
-            _x0 = int(_w * 0.20); _x1 = int(_w * 0.80)
-            _y1 = int(_h * 0.80)
-            raw = raw[:_y1, _x0:_x1]
+            # Black-mask: zero out 20% sides and 20% bottom to exclude
+            # irrelevant areas without changing frame dimensions or K.
             frame = raw.copy()
+            if not args.no_crop:
+                _h, _w = frame.shape[:2]
+                _x0 = int(_w * 0.20); _x1 = int(_w * 0.80)
+                _y1 = int(_h * 0.80)
+                frame[:, :_x0] = 0
+                frame[:, _x1:] = 0
+                frame[_y1:, :] = 0
+                raw = frame  # downstream uses raw for HSV mask
             if USE_CUDA:
                 _gpu_raw.upload(raw)
 
@@ -919,7 +693,7 @@ if __name__ == '__main__':
                     nt.set_ok_to_shoot(True)
                     nt.set_ball_detected(False)
 
-                cv2.imshow('ballshots6', frame)
+                cv2.imshow('ballshots7', frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
                 continue
@@ -967,6 +741,12 @@ if __name__ == '__main__':
                                      R_T_frozen, cam_pos_frozen)
                         if ball_px is not None else None)
 
+            # Reject detections that project below the floor (world Z < 0).
+            # world_xy is (x_cm, z_cm); z_cm < 0 means below the tag plane.
+            if world_xy is not None and world_xy[1] < 0.0:
+                world_xy = None
+                ball_px  = None
+
             now_t = time.time()
 
             # ==========================================================
@@ -985,6 +765,15 @@ if __name__ == '__main__':
                     nt.set_ball_detected(False)
                     print(f'[ARMED] shot_id={cur_shot_id}  '
                           f'speed={cur_speed:.0f}  angle={cur_angle:.1f}')
+                    # ── Start video recording ──
+                    ts_str = time.strftime('%Y%m%d_%H%M%S')
+                    video_path = os.path.join(
+                        VIDEO_DIR, f'shot_{cur_shot_id}_{ts_str}.avi')
+                    video_writer = cv2.VideoWriter(
+                        video_path,
+                        cv2.VideoWriter.fourcc('M', 'J', 'P', 'G'),
+                        cam_fps, (actual_w, actual_h))
+                    print(f'[VIDEO] Recording → {video_path}')
 
             # ==========================================================
             #  STATE: ARMED  — looking for ball to appear
@@ -1069,6 +858,12 @@ if __name__ == '__main__':
                     BASE_DIR, cur_shot_id, cur_speed, cur_angle,
                     cur_traj, all_shots)
 
+                # ── Stop video recording ──
+                if video_writer is not None:
+                    video_writer.release()
+                    video_writer = None
+                    print(f'[VIDEO] Saved → {video_path}')
+
                 nt.set_landing(land_x, land_y)
                 nt.set_shot_count(shot_count)
 
@@ -1133,55 +928,27 @@ if __name__ == '__main__':
                     (20, 120), cv2.FONT_HERSHEY_SIMPLEX,
                     0.7, (255, 0, 0), 2)
 
-            # ── Live graph update ──
-            if use_graph:
-                if world_xy is not None:
-                    # world_xy is in cm → convert to metres
-                    graph_times.append(now_pc)
-                    graph_ys.append(world_xy[1] / 100.0)
-
-                # prune points older than GRAPH_WINDOW
-                cutoff = now_pc - GRAPH_WINDOW
-                while graph_times and graph_times[0] < cutoff:
-                    graph_times.popleft()
-                    graph_ys.popleft()
-
-                # throttle plot refreshes
-                if now_pc - graph_last_update >= GRAPH_UPDATE_INTERVAL:
-                    graph_last_update = now_pc
-                    if graph_times:
-                        ts = np.array(graph_times)
-                        ts = ts - ts[-1]           # relative, 0 = now
-                        ys = np.array(graph_ys)
-                        graph_line.set_data(ts, ys)
-                        graph_ax.set_xlim(-GRAPH_WINDOW, 0.5)
-                        y_lo = float(ys.min()) - 0.3
-                        y_hi = float(ys.max()) + 0.3
-                        if y_hi - y_lo < 0.6:
-                            mid = (y_hi + y_lo) / 2
-                            y_lo, y_hi = mid - 0.3, mid + 0.3
-                        graph_ax.set_ylim(y_lo, y_hi)
-                    try:
-                        graph_fig.canvas.draw_idle()
-                        graph_fig.canvas.flush_events()
-                    except Exception:
-                        pass
-
             if args.show_mask:
                 # Overlay yellow-tinted mask onto frame
                 mask_color = np.zeros_like(frame)
                 mask_color[mask > 0] = (0, 220, 255)   # yellow tint
                 frame = cv2.addWeighted(frame, 1.0, mask_color, 0.45, 0)
-            cv2.imshow('ballshots6', frame)
+
+            # ── Write frame to video if recording ──
+            if video_writer is not None:
+                video_writer.write(frame)
+
+            cv2.imshow('ballshots7', frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
     except KeyboardInterrupt:
         print('Interrupted')
     finally:
+        if video_writer is not None:
+            video_writer.release()
+            print(f'[VIDEO] Saved (interrupted) → {video_path}')
         reader.stop()
         cap.release()
         cv2.destroyAllWindows()
-        if use_graph:
-            plt.close('all')
         print(f'Session: {shot_count} shots tracked.')

@@ -3,5 +3,4 @@ numpy
 pyntcore>=2026.0.0
 matplotlib
 scipy
-# Optional: if you prefer the pupil_apriltags detector
-# pupil-apriltags
+pupil-apriltags
